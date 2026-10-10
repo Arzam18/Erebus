@@ -1,18 +1,3 @@
-//! probe: standalone batch NNUE evaluator for benchmarking/validating the
-//! net against a large FEN corpus.
-//!
-//! Deliberately bypasses `Board` entirely. `Board::empty()` builds a full
-//! `Magics` (rook/bishop magic-bitboard attack tables -- 102,400 + 5,248
-//! entries via slow ray-casting) that pure evaluation never needs; paying
-//! that once per FEN would dominate a large batch. This module only builds
-//! what `nnue::evaluate_with_net` reads: two accumulators and a side to
-//! move.
-//!
-//! Modes (wired up in main.rs):
-//!   --probe-fen "<fen>"                 single FEN, prints eval, exits
-//!   --probe <file> [--probe-threads N]  batch eval over a FEN-per-line file
-//!   --probe-symmetry "<fen>" "<mirror>" color-flip symmetry self-test
-
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::thread;
@@ -23,12 +8,6 @@ use crate::nnue::{self, DualAccumulator};
 
 type SqPieces = [Option<(Piece, Color)>; 64];
 
-/// Parse only what NNUE features need: piece placement and side to move.
-/// Skips castling/ep/clocks -- eval doesn't use them.
-///
-/// Returns `None` for malformed input (missing king(s), bad rank/file
-/// bounds, empty placement field) so callers can skip the line with a
-/// warning instead of panicking mid-batch.
 fn parse_fen_for_eval(fen: &str) -> Option<(SqPieces, Color)> {
     let mut sq_piece: SqPieces = [None; 64];
     let mut kings = [false; 2];
@@ -41,7 +20,10 @@ fn parse_fen_for_eval(fen: &str) -> Option<(SqPieces, Color)> {
     let mut file: i32 = 0;
     for c in placement.chars() {
         match c {
-            '/' => { rank -= 1; file = 0; }
+            '/' => {
+                rank -= 1;
+                file = 0;
+            }
             '1'..='8' => file += (c as i32) - ('0' as i32),
             _ => {
                 if let Some((piece, color)) = Piece::from_char(c) {
@@ -61,12 +43,14 @@ fn parse_fen_for_eval(fen: &str) -> Option<(SqPieces, Color)> {
     if kings != [true, true] {
         return None;
     }
-    let stm = if stm_str == "b" { Color::Black } else { Color::White };
+    let stm = if stm_str == "b" {
+        Color::Black
+    } else {
+        Color::White
+    };
     Some((sq_piece, stm))
 }
 
-/// Evaluate a single FEN against an already-locked net. Returns `None` if
-/// the FEN could not be parsed (missing king, malformed placement, etc.).
 fn eval_fen(net: &nnue::Net, fen: &str) -> Option<i32> {
     let (sq_piece, stm) = parse_fen_for_eval(fen)?;
     let mut acc = DualAccumulator::zeroed();
@@ -74,7 +58,6 @@ fn eval_fen(net: &nnue::Net, fen: &str) -> Option<i32> {
     Some(nnue::evaluate_with_net(net, &acc, stm))
 }
 
-/// Single-FEN mode: `erebus --probe-fen "<fen>"`. Prints the eval and exits.
 pub fn run_single(fen: &str) {
     let guard = nnue::read_lock();
     let net = guard.as_ref().expect("net not loaded");
@@ -87,11 +70,6 @@ pub fn run_single(fen: &str) {
     }
 }
 
-/// Color-flip symmetry self-test. Evals are side-to-move relative, so a
-/// position and its color-flipped mirror (ranks flipped, piece colors
-/// swapped, side to move swapped) must evaluate identically; any difference
-/// points at a perspective bug in feature indexing. The caller supplies both
-/// FENs.
 pub fn run_symmetry_check(fen: &str, mirrored_fen: &str) {
     let guard = nnue::read_lock();
     let net = guard.as_ref().expect("net not loaded");
@@ -108,9 +86,6 @@ pub fn run_symmetry_check(fen: &str, mirrored_fen: &str) {
     println!("eval(fen) - eval(mirrored_fen) = {} (want 0)", a - b);
 }
 
-/// Batch mode: `erebus --probe fens.txt [--probe-threads N]`.
-/// Skips malformed lines with a warning (first 5 per chunk) rather than
-/// aborting the whole run.
 pub fn run_batch(fen_path: &str, threads: usize) {
     let file = fs::File::open(fen_path).unwrap_or_else(|e| {
         eprintln!("Could not open '{fen_path}': {e}");

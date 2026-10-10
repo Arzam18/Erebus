@@ -1,9 +1,12 @@
 mod bench;
 mod bitboard;
-mod book;
 mod board;
+mod book;
 mod datagen;
 mod eval;
+
+#[allow(dead_code)]
+mod fbk;
 mod movegen;
 mod moves;
 mod nnue;
@@ -16,13 +19,15 @@ mod uci;
 mod zobrist;
 
 fn main() {
-
     nnue::load_embedded();
 
     let args: Vec<String> = std::env::args().collect();
 
     if args.get(1).map(String::as_str) == Some("bench") {
-        let depth = args.get(2).and_then(|v| v.parse::<u32>().ok()).unwrap_or(bench::DEFAULT_DEPTH);
+        let depth = args
+            .get(2)
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(bench::DEFAULT_DEPTH);
         bench::run(depth);
         return;
     }
@@ -35,7 +40,9 @@ fn main() {
         let threads: usize = parse_flag_value(&args, "--probe-threads")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_else(|| {
-                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
             });
         probe::run_batch(&fen_path, threads);
         return;
@@ -58,7 +65,9 @@ fn main() {
 
     if let Some(ref path) = eval_path {
         match nnue::load(path) {
-            Ok(()) => eprintln!("info string NNUE eval file loaded (overrides embedded net): {path}"),
+            Ok(()) => {
+                eprintln!("info string NNUE eval file loaded (overrides embedded net): {path}")
+            }
             Err(e) => eprintln!(
                 "info string Failed to load EvalFile '{path}': {e} -- keeping embedded net"
             ),
@@ -67,24 +76,22 @@ fn main() {
 
     if let Some(out) = parse_flag_value(&args, "--datagen") {
         let num = |flag: &str, default: u64| {
-            parse_flag_value(&args, flag).and_then(|v| v.parse::<u64>().ok()).unwrap_or(default)
+            parse_flag_value(&args, flag)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(default)
         };
         let seed = parse_flag_value(&args, "--seed")
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or_else(|| book::Rng::from_time().next());
         datagen::run(datagen::Config {
             out,
-            games:        num("--games", 10_000),
+            games: num("--games", 10_000),
             threads,
-            nodes:        num("--nodes", 5000).max(1),
-            book:         match parse_flag_value(&args, "--book") {
-                Some(b) if b.eq_ignore_ascii_case("none") => None,
-                Some(b) => Some(b),
-                None => Some(DATAGEN_BOOK.to_string()),
-            },
+            nodes: num("--nodes", 5000).max(1),
+            book: parse_flag_value(&args, "--book").filter(|b| !b.eq_ignore_ascii_case("none")),
             book_uniform: args.iter().any(|a| a == "--book-uniform"),
             random_plies: num("--random-plies", 4) as u32,
-            syzygy:       syzygy_path,
+            syzygy: syzygy_path,
             seed,
             hash_mb,
         });
@@ -101,12 +108,6 @@ fn main() {
     uci::uci_loop(syzygy_path, threads, hash_mb);
 }
 
-/// Default datagen opening book: short, balanced openings (the CCRL test book).
-const DATAGEN_BOOK: &str = "books/TCEC26.bin";
-
-/// Extract the value of `--<flag> <value>` (or `--<flag>=<value>`) from the
-/// argument list. Returns `None` if the flag is absent or has no following
-/// value.
 fn parse_flag_value(args: &[String], flag: &str) -> Option<String> {
     let eq_prefix = format!("{flag}=");
     let mut iter = args.iter().peekable();

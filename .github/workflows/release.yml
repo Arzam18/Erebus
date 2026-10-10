@@ -1,7 +1,13 @@
-# Builds release binaries for every GitHub-hosted runner platform and attaches
-# them to the release. Runs when a release is published; can also be started by
-# hand (Actions tab -> Release binaries -> Run workflow), which uploads the
-# binaries as workflow artifacts instead.
+# Builds release binaries for every GitHub-hosted runner platform and publishes
+# them as a GitHub Release. Runs whenever a tag matching v*.*.* is pushed:
+#
+#   git tag v1.6.0
+#   git push origin v1.6.0
+#
+# Each matrix entry builds one binary and uploads it as a workflow artifact; the
+# final job collects them all into one release attached to that tag. It can
+# also be started by hand (Actions tab -> Release binaries -> Run workflow),
+# which only builds the artifacts and skips the release.
 #
 # .cargo/config.toml builds for target-cpu=native, which is not portable, so
 # every job overrides it via RUSTFLAGS. x86-64 is built at each
@@ -13,8 +19,9 @@
 name: Release binaries
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*.*.*"
   workflow_dispatch:
 
 permissions:
@@ -60,6 +67,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.cpu }}
+
       - name: Build
         env:
           RUSTFLAGS: -C target-cpu=${{ matrix.cpu }}
@@ -68,8 +79,8 @@ jobs:
       - name: Package
         id: pkg
         run: |
-          if [ "${{ github.event_name }}" = release ]; then
-            version="${{ github.event.release.tag_name }}"
+          if [ "${{ github.ref_type }}" = tag ]; then
+            version="${{ github.ref_name }}"
           else
             version="$(git rev-parse --short HEAD)"
           fi
@@ -84,15 +95,27 @@ jobs:
         if: matrix.bench
         run: ./dist/${{ steps.pkg.outputs.asset }} bench
 
-      - name: Upload to release
-        if: github.event_name == 'release'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" "dist/${{ steps.pkg.outputs.asset }}" --clobber
-
       - name: Upload artifact
-        if: github.event_name != 'release'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.pkg.outputs.asset }}
           path: dist/${{ steps.pkg.outputs.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create/update the release with all assets attached
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

@@ -1,11 +1,3 @@
-//! `erebus bench [depth]`: fixed-depth, single-threaded search over a fixed
-//! position set, ending with `<nodes> nodes <nps> nps`.
-//!
-//! The node total is the build's bench signature (OpenBench checks it), so it
-//! must be identical on every run: each position gets a fresh hash table and
-//! fresh move-ordering tables, there is no time limit, no Syzygy and no book.
-//! Any change to search or eval that alters the tree changes the signature.
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Instant;
@@ -69,9 +61,13 @@ pub fn run(depth: u32) {
     let start = Instant::now();
 
     for (i, fen) in FENS.iter().enumerate() {
-        let mut board = Board::from_fen(fen)
-            .unwrap_or_else(|| panic!("bench: bad FEN #{}: {fen}", i + 1));
-        let limits = SearchLimits { max_depth: depth, quiet: true, ..SearchLimits::default() };
+        let mut board =
+            Board::from_fen(fen).unwrap_or_else(|| panic!("bench: bad FEN #{}: {fen}", i + 1));
+        let limits = SearchLimits {
+            max_depth: depth,
+            quiet: true,
+            ..SearchLimits::default()
+        };
         let mut searcher = Searcher::new(
             limits,
             Arc::new(TranspositionTable::new(HASH_MB)),
@@ -87,7 +83,10 @@ pub fn run(depth: u32) {
         total_nodes += searcher.nodes;
         eprintln!(
             "position {:>2}/{}  bestmove {}  nodes {}",
-            i + 1, FENS.len(), best.to_uci(), searcher.nodes,
+            i + 1,
+            FENS.len(),
+            best.to_uci(),
+            searcher.nodes,
         );
     }
 

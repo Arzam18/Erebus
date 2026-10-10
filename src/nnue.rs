@@ -1,51 +1,10 @@
-//! nnue: incremental NNUE evaluation.
-//!
-//! ============================== ARCHITECTURE ==============================
-//! A single perspective-pair feature transformer with one hidden layer and
-//! a scalar output.
-//!
-//!     (768 -> HL) x 2  ->  1
-//!
-//!   * 768 inputs      = 2 colors * 6 piece types * 64 squares
-//!   * HL              = hidden / accumulator width per perspective
-//!   * SCReLU          = clipped-then-squared activation, clamp to [0, QA]
-//!   * QA = 255, QB = 64, SCALE = 400  (bullet's standard quantisation)
-//!
-//! Two fixed-perspective accumulators are maintained on `Board`: a
-//! White-perspective accumulator and a Black-perspective accumulator.
-//! Whichever color is on move supplies the "stm" half of the network input,
-//! the other the "ntm" half. Which accumulator IS White's / Black's never
-//! depends on whose turn it is, so `Board::make_move` updates them
-//! incrementally:
-//!
-//!   - Any move changes at most 4 (piece, color, square) features, so we
-//!     toggle just those in/out of both accumulators -- O(1) per move.
-//!   - `unmake_move` replays the same toggles inverted.
-//!
-//! ============================== NET SOURCE ==============================
-//! The engine ships with a network embedded into the executable via
-//! `include_bytes!` (see `EMBEDDED_NET`), loaded once at startup in
-//! `main()`. `nets/net.nnue` is a `bullet` export for exactly this
-//! architecture: `(768 x HL) i16` feature-transformer weights (feature-major
-//! -- each feature's HL weights contiguous), `HL i16` feature-transformer
-//! biases, `2*HL i16` output weights (first HL = stm perspective, next HL =
-//! ntm perspective), `1 i16` output bias, then trailing `"bullet"` padding
-//! which is ignored.
-//!
-//! `load` (runtime, from a file path) exists as a diagnostic override,
-//! reachable via `--eval-file` or `setoption name EvalFile value <path>`.
-//! Callers of `load` must re-snapshot any live board afterward (see
-//! `Board::reload_net`).
-
 use std::fs;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use crate::board::{Board, Color, Piece};
 
-/// Hidden layer / accumulator width per perspective.
 pub const HL: usize = 1024;
 
-/// Number of raw board features: 2 colors * 6 pieces * 64 squares.
 const INPUT_SIZE: usize = 768;
 
 const QA: i64 = 255;
@@ -55,39 +14,23 @@ const SCALE: i64 = 400;
 const EMBEDDED_NET: &[u8] = include_bytes!("../nets/net.nnue");
 
 pub struct Net {
-    /// Feature-transformer weights, feature-major: `l0w[feature * HL + h]`.
     l0w: Vec<i16>,
-    /// Feature-transformer biases: `l0b[h]`.
+
     l0b: Vec<i16>,
-    /// Output weights: `l1w[0..HL]` applied to the stm accumulator,
-    /// `l1w[HL..2*HL]` applied to the ntm accumulator.
+
     l1w: Vec<i16>,
-    /// Scalar output bias (raw quantised i16 units).
+
     l1b: i32,
 }
 
-/// The active net, behind an `Arc` so a `Board` can take a cheap owning
-/// snapshot once (at construction / after an EvalFile swap) and then read
-/// it with zero synchronisation on every eval and every move. The `RwLock`
-/// is only touched when installing a net or taking a snapshot, never in the
-/// search hot loop.
 static NET: RwLock<Option<Arc<Net>>> = RwLock::new(None);
 
-/// Install the network embedded in the executable as the active net.
-/// Must be called once at process startup, before any `Board` is
-/// constructed. Panics on failure -- a corrupt embedded net means the
-/// binary was built wrong, and there is no classical eval to fall back to.
 pub fn load_embedded() {
     let net = parse_net(EMBEDDED_NET)
         .unwrap_or_else(|e| panic!("embedded NNUE net failed to parse: {e}"));
     *NET.write().unwrap() = Some(Arc::new(net));
 }
 
-/// Diagnostic / experimentation override: load a net of the *same*
-/// architecture from a file on disk at runtime (`--eval-file` /
-/// `setoption name EvalFile`). Does NOT refresh any live board's
-/// accumulators -- the caller (the `EvalFile` setoption handler in `uci.rs`)
-/// must call `Board::reload_net` so the board picks up the new snapshot.
 pub fn load(path: &str) -> Result<(), String> {
     let buf = fs::read(path).map_err(|e| format!("reading '{path}': {e}"))?;
     let net = parse_net(&buf)?;
@@ -95,15 +38,10 @@ pub fn load(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Take an owning snapshot of the current net (one `RwLock` read + one
-/// refcount bump). `None` if no net has been installed yet.
 pub fn current_net() -> Option<Arc<Net>> {
     NET.read().unwrap().clone()
 }
 
-/// Acquire a read lock on the net for a caller-controlled scope. Used only
-/// by the standalone `probe` batch modes, which hold it once per worker
-/// thread across a whole chunk; the search never calls this.
 pub fn read_lock() -> RwLockReadGuard<'static, Option<Arc<Net>>> {
     NET.read().unwrap()
 }
@@ -122,11 +60,7 @@ fn read_i16_block(buf: &[u8], offset: &mut usize, n: usize) -> Vec<i16> {
 /// Parse a `bullet` export for the `(768 -> HL) x 2 -> 1` SCReLU net.
 ///
 /// Layout (little-endian i16 throughout), matching `chal.c`'s `net.h`:
-///   l0w : INPUT_SIZE * HL   feature-major
-///   l0b : HL
-///   l1w : 2 * HL            (stm half, then ntm half)
-///   l1b : 1
-///   ...  trailing "bullet" padding, ignored.
+
 fn parse_net(buf: &[u8]) -> Result<Net, String> {
     let n_l0w = INPUT_SIZE * HL;
     let n_l0b = HL;
@@ -173,11 +107,6 @@ fn parse_net(buf: &[u8]) -> Result<Net, String> {
     Ok(Net { l0w, l0b, l1w, l1b })
 }
 
-/// L0 feature index for one (piece, color, square) as seen from
-/// `perspective`.
-///
-///   White perspective: index = 384*color        + 64*piece + sq
-///   Black perspective: index = 384*(color ^ 1)   + 64*piece + (sq ^ 56)
 #[inline(always)]
 fn feature_index(perspective: Color, piece: Piece, piece_color: Color, sq: u8) -> usize {
     let (rel_color, rel_sq) = match perspective {
@@ -193,12 +122,6 @@ fn weight_row(net: &Net, feature: usize) -> &[i16] {
     &net.l0w[base..base + HL]
 }
 
-/// One perspective's accumulator: feature-transformer bias plus the sum of
-/// the weight rows of every active feature. Kept in **i16** -- half the
-/// memory traffic of i32 per toggle and per eval load, and it lets the
-/// forward pass fuse SCReLU square + output-weight multiply into a single
-/// `madd_epi16`. A bullet-quantised net keeps every hidden unit well inside
-/// i16 range (32 pieces * max|l0w|); `refresh_one` debug-asserts this.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Accumulator {
     pub v: [i16; HL],
@@ -210,7 +133,6 @@ impl Accumulator {
     }
 }
 
-/// Both perspectives, fixed by color (NOT by side-to-move).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DualAccumulator {
     pub white: Accumulator,
@@ -219,14 +141,15 @@ pub struct DualAccumulator {
 
 impl DualAccumulator {
     pub fn zeroed() -> Self {
-        DualAccumulator { white: Accumulator::zeroed(), black: Accumulator::zeroed() }
+        DualAccumulator {
+            white: Accumulator::zeroed(),
+            black: Accumulator::zeroed(),
+        }
     }
 }
 
 const QA_I16: i16 = QA as i16;
 
-/// Clamped-square-times-weight for one lane, matching the SIMD `mullo_epi16`
-/// (`c*w` truncates to i16 -- unreachable for a `parse_net`-validated net).
 #[inline(always)]
 fn screlu_w(acc: i16, w: i16) -> i64 {
     let c = acc.clamp(0, QA_I16);
@@ -237,13 +160,17 @@ fn screlu_w(acc: i16, w: i16) -> i64 {
 #[inline]
 fn acc_add(acc: &mut [i16], row: &[i16]) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    unsafe { return acc_addsub_avx2(acc, row, false) }
+    unsafe {
+        return acc_addsub_avx2(acc, row, false);
+    }
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     if std::is_x86_feature_detected!("avx2") {
         unsafe { return acc_addsub_avx2(acc, row, false) }
     }
     #[cfg(target_arch = "aarch64")]
-    unsafe { return acc_addsub_neon(acc, row, false) }
+    unsafe {
+        return acc_addsub_neon(acc, row, false);
+    }
     #[allow(unreachable_code)]
     acc_addsub_scalar(acc, row, false)
 }
@@ -252,13 +179,17 @@ fn acc_add(acc: &mut [i16], row: &[i16]) {
 #[inline]
 fn acc_sub(acc: &mut [i16], row: &[i16]) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    unsafe { return acc_addsub_avx2(acc, row, true) }
+    unsafe {
+        return acc_addsub_avx2(acc, row, true);
+    }
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     if std::is_x86_feature_detected!("avx2") {
         unsafe { return acc_addsub_avx2(acc, row, true) }
     }
     #[cfg(target_arch = "aarch64")]
-    unsafe { return acc_addsub_neon(acc, row, true) }
+    unsafe {
+        return acc_addsub_neon(acc, row, true);
+    }
     #[allow(unreachable_code)]
     acc_addsub_scalar(acc, row, true)
 }
@@ -269,18 +200,20 @@ fn acc_set(acc: &mut [i16], bias: &[i16]) {
     acc[..n].copy_from_slice(&bias[..n]);
 }
 
-/// `dst = src` with every `(row, add)` applied, in one fused pass: a lazy
-/// accumulator step reads the parent and writes the child exactly once.
 #[inline]
 fn acc_update(dst: &mut [i16], src: &[i16], rows: &[(&[i16], bool)]) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    unsafe { return acc_update_avx2(dst, src, rows) }
+    unsafe {
+        return acc_update_avx2(dst, src, rows);
+    }
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     if std::is_x86_feature_detected!("avx2") {
         unsafe { return acc_update_avx2(dst, src, rows) }
     }
     #[cfg(target_arch = "aarch64")]
-    unsafe { return acc_update_neon(dst, src, rows) }
+    unsafe {
+        return acc_update_neon(dst, src, rows);
+    }
     #[allow(unreachable_code)]
     acc_update_scalar(dst, src, rows)
 }
@@ -288,13 +221,17 @@ fn acc_update(dst: &mut [i16], src: &[i16], rows: &[(&[i16], bool)]) {
 #[inline]
 fn screlu_dot(acc: &[i16], w: &[i16]) -> i64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    unsafe { return screlu_dot_avx2(acc, w) }
+    unsafe {
+        return screlu_dot_avx2(acc, w);
+    }
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     if std::is_x86_feature_detected!("avx2") {
         unsafe { return screlu_dot_avx2(acc, w) }
     }
     #[cfg(target_arch = "aarch64")]
-    unsafe { return screlu_dot_neon(acc, w) }
+    unsafe {
+        return screlu_dot_neon(acc, w);
+    }
     #[allow(unreachable_code)]
     screlu_dot_scalar(acc, w)
 }
@@ -302,17 +239,20 @@ fn screlu_dot(acc: &[i16], w: &[i16]) -> i64 {
 fn acc_addsub_scalar(acc: &mut [i16], row: &[i16], sub: bool) {
     let n = acc.len().min(row.len());
     if sub {
-        for h in 0..n { acc[h] = acc[h].wrapping_sub(row[h]); }
+        for h in 0..n {
+            acc[h] = acc[h].wrapping_sub(row[h]);
+        }
     } else {
-        for h in 0..n { acc[h] = acc[h].wrapping_add(row[h]); }
+        for h in 0..n {
+            acc[h] = acc[h].wrapping_add(row[h]);
+        }
     }
 }
 
-/// Shortest length among `dst`, `src` and every row: the span all kernels
-/// may touch.
 #[inline]
 fn update_len(dst: &[i16], src: &[i16], rows: &[(&[i16], bool)]) -> usize {
-    rows.iter().fold(dst.len().min(src.len()), |n, (row, _)| n.min(row.len()))
+    rows.iter()
+        .fold(dst.len().min(src.len()), |n, (row, _)| n.min(row.len()))
 }
 
 fn acc_update_scalar(dst: &mut [i16], src: &[i16], rows: &[(&[i16], bool)]) {
@@ -342,14 +282,24 @@ unsafe fn acc_addsub_avx2(acc: &mut [i16], row: &[i16], sub: bool) {
     while h + 16 <= n {
         let a = _mm256_loadu_si256(acc.as_ptr().add(h) as *const __m256i);
         let r = _mm256_loadu_si256(row.as_ptr().add(h) as *const __m256i);
-        let s = if sub { _mm256_sub_epi16(a, r) } else { _mm256_add_epi16(a, r) };
+        let s = if sub {
+            _mm256_sub_epi16(a, r)
+        } else {
+            _mm256_add_epi16(a, r)
+        };
         _mm256_storeu_si256(acc.as_mut_ptr().add(h) as *mut __m256i, s);
         h += 16;
     }
     if sub {
-        while h < n { acc[h] = acc[h].wrapping_sub(row[h]); h += 1; }
+        while h < n {
+            acc[h] = acc[h].wrapping_sub(row[h]);
+            h += 1;
+        }
     } else {
-        while h < n { acc[h] = acc[h].wrapping_add(row[h]); h += 1; }
+        while h < n {
+            acc[h] = acc[h].wrapping_add(row[h]);
+            h += 1;
+        }
     }
 }
 
@@ -364,7 +314,11 @@ unsafe fn acc_update_avx2(dst: &mut [i16], src: &[i16], rows: &[(&[i16], bool)])
         let mut v = _mm256_loadu_si256(src.as_ptr().add(h) as *const __m256i);
         for &(row, add) in rows {
             let r = _mm256_loadu_si256(row.as_ptr().add(h) as *const __m256i);
-            v = if add { _mm256_add_epi16(v, r) } else { _mm256_sub_epi16(v, r) };
+            v = if add {
+                _mm256_add_epi16(v, r)
+            } else {
+                _mm256_sub_epi16(v, r)
+            };
         }
         _mm256_storeu_si256(dst.as_mut_ptr().add(h) as *mut __m256i, v);
         h += 16;
@@ -372,7 +326,11 @@ unsafe fn acc_update_avx2(dst: &mut [i16], src: &[i16], rows: &[(&[i16], bool)])
     while h < n {
         let mut v = src[h];
         for &(row, add) in rows {
-            v = if add { v.wrapping_add(row[h]) } else { v.wrapping_sub(row[h]) };
+            v = if add {
+                v.wrapping_add(row[h])
+            } else {
+                v.wrapping_sub(row[h])
+            };
         }
         dst[h] = v;
         h += 1;
@@ -397,7 +355,10 @@ unsafe fn screlu_dot_avx2(acc: &[i16], w: &[i16]) -> i64 {
         let prod = _mm256_madd_epi16(c, cw);
 
         sum = _mm256_add_epi64(sum, _mm256_cvtepi32_epi64(_mm256_castsi256_si128(prod)));
-        sum = _mm256_add_epi64(sum, _mm256_cvtepi32_epi64(_mm256_extracti128_si256::<1>(prod)));
+        sum = _mm256_add_epi64(
+            sum,
+            _mm256_cvtepi32_epi64(_mm256_extracti128_si256::<1>(prod)),
+        );
         h += 16;
     }
     let lo = _mm256_castsi256_si128(sum);
@@ -422,14 +383,24 @@ unsafe fn acc_addsub_neon(acc: &mut [i16], row: &[i16], sub: bool) {
     while h + 8 <= n {
         let a = vld1q_s16(acc.as_ptr().add(h));
         let r = vld1q_s16(row.as_ptr().add(h));
-        let s = if sub { vsubq_s16(a, r) } else { vaddq_s16(a, r) };
+        let s = if sub {
+            vsubq_s16(a, r)
+        } else {
+            vaddq_s16(a, r)
+        };
         vst1q_s16(acc.as_mut_ptr().add(h), s);
         h += 8;
     }
     if sub {
-        while h < n { acc[h] = acc[h].wrapping_sub(row[h]); h += 1; }
+        while h < n {
+            acc[h] = acc[h].wrapping_sub(row[h]);
+            h += 1;
+        }
     } else {
-        while h < n { acc[h] = acc[h].wrapping_add(row[h]); h += 1; }
+        while h < n {
+            acc[h] = acc[h].wrapping_add(row[h]);
+            h += 1;
+        }
     }
 }
 
@@ -444,7 +415,11 @@ unsafe fn acc_update_neon(dst: &mut [i16], src: &[i16], rows: &[(&[i16], bool)])
         let mut v = vld1q_s16(src.as_ptr().add(h));
         for &(row, add) in rows {
             let r = vld1q_s16(row.as_ptr().add(h));
-            v = if add { vaddq_s16(v, r) } else { vsubq_s16(v, r) };
+            v = if add {
+                vaddq_s16(v, r)
+            } else {
+                vsubq_s16(v, r)
+            };
         }
         vst1q_s16(dst.as_mut_ptr().add(h), v);
         h += 8;
@@ -452,7 +427,11 @@ unsafe fn acc_update_neon(dst: &mut [i16], src: &[i16], rows: &[(&[i16], bool)])
     while h < n {
         let mut v = src[h];
         for &(row, add) in rows {
-            v = if add { v.wrapping_add(row[h]) } else { v.wrapping_sub(row[h]) };
+            v = if add {
+                v.wrapping_add(row[h])
+            } else {
+                v.wrapping_sub(row[h])
+            };
         }
         dst[h] = v;
         h += 1;
@@ -490,7 +469,6 @@ unsafe fn screlu_dot_neon(acc: &[i16], w: &[i16]) -> i64 {
     total
 }
 
-/// Full from-scratch build of one perspective's accumulator from the board.
 fn refresh_one(
     net: &Net,
     sq_piece: &[Option<(Piece, Color)>; 64],
@@ -499,7 +477,9 @@ fn refresh_one(
 ) {
     acc_set(&mut acc.v, &net.l0b);
     for (sq, slot) in sq_piece.iter().enumerate() {
-        let Some((piece, color)) = *slot else { continue };
+        let Some((piece, color)) = *slot else {
+            continue;
+        };
         let f = feature_index(perspective, piece, color, sq as u8);
         acc_add(&mut acc.v, weight_row(net, f));
     }
@@ -507,45 +487,53 @@ fn refresh_one(
     #[cfg(debug_assertions)]
     {
         let mut wide = [0i32; HL];
-        for h in 0..HL { wide[h] = net.l0b[h] as i32; }
+        for h in 0..HL {
+            wide[h] = net.l0b[h] as i32;
+        }
         for (sq, slot) in sq_piece.iter().enumerate() {
             if let Some((piece, color)) = *slot {
                 let f = feature_index(perspective, piece, color, sq as u8);
                 let row = weight_row(net, f);
-                for h in 0..HL { wide[h] += row[h] as i32; }
+                for h in 0..HL {
+                    wide[h] += row[h] as i32;
+                }
             }
         }
         for h in 0..HL {
             debug_assert!(
                 wide[h] > i16::MIN as i32 + 256 && wide[h] < i16::MAX as i32 - 256,
                 "NNUE hidden unit {h} = {} is within 256 of the i16 boundary -- this net is too \
-                 hot for i16 accumulators", wide[h],
+                 hot for i16 accumulators",
+                wide[h],
             );
-            debug_assert_eq!(wide[h] as i16, acc.v[h], "i16 accumulator diverged at unit {h}");
+            debug_assert_eq!(
+                wide[h] as i16, acc.v[h],
+                "i16 accumulator diverged at unit {h}"
+            );
         }
     }
 }
 
-/// Full from-scratch build of both perspectives' accumulators.
-pub fn refresh_all(
-    net: &Net,
-    sq_piece: &[Option<(Piece, Color)>; 64],
-    dual: &mut DualAccumulator,
-) {
+pub fn refresh_all(net: &Net, sq_piece: &[Option<(Piece, Color)>; 64], dual: &mut DualAccumulator) {
     refresh_one(net, sq_piece, Color::White, &mut dual.white);
     refresh_one(net, sq_piece, Color::Black, &mut dual.black);
 }
 
-/// One input-feature change: `(piece, color, square, added)`. A move makes
-/// at most 4 (castling moves king + rook).
 pub type FeatDelta = (Piece, Color, u8, bool);
 
-/// `child = parent` with `feat` applied, for both perspectives.
-fn update_from_parent(net: &Net, parent: &DualAccumulator, child: &mut DualAccumulator, feat: &[FeatDelta]) {
+fn update_from_parent(
+    net: &Net,
+    parent: &DualAccumulator,
+    child: &mut DualAccumulator,
+    feat: &[FeatDelta],
+) {
     for perspective in [Color::White, Color::Black] {
         let mut rows: [(&[i16], bool); 4] = [(&[], false); 4];
         for (slot, &(piece, color, sq, add)) in rows.iter_mut().zip(feat) {
-            *slot = (weight_row(net, feature_index(perspective, piece, color, sq)), add);
+            *slot = (
+                weight_row(net, feature_index(perspective, piece, color, sq)),
+                add,
+            );
         }
         let (src, dst) = match perspective {
             Color::White => (&parent.white.v, &mut child.white.v),
@@ -555,49 +543,36 @@ fn update_from_parent(net: &Net, parent: &DualAccumulator, child: &mut DualAccum
     }
 }
 
-/// Entries in an `AccStack`. The search never goes deeper than its
-/// `MAX_PLY` (128) below the root, and `Searcher::search` rebases the stack
-/// at the root, so this is never exhausted mid-search.
 const ACC_STACK_CAP: usize = 256;
 
-/// Lazily-updated accumulators, one entry per `make_move` along the current
-/// line. `make_move` only records the move's feature diff; `unmake_move`
-/// steps back an entry. The accumulators are brought up to date on demand
-/// (`current`) from the nearest computed ancestor, so positions that are
-/// never evaluated -- TT cutoffs, TT-eval hits, pruned moves -- cost no
-/// accumulator work at all.
 #[derive(Clone)]
 pub struct AccStack {
-    accs:  Box<[DualAccumulator]>,
-    /// `diffs[i]`: the feature changes taking entry `i - 1` to entry `i`.
+    accs: Box<[DualAccumulator]>,
+
     diffs: Box<[([FeatDelta; 4], u8)]>,
-    /// Entry of the current position.
-    top:   usize,
-    /// Entries `0..=clean` hold computed accumulators; `clean < i <= top`
-    /// are pending.
+
+    top: usize,
+
     clean: usize,
 }
 
 impl AccStack {
     pub fn new() -> Self {
         AccStack {
-            accs:  vec![DualAccumulator::zeroed(); ACC_STACK_CAP].into_boxed_slice(),
-            diffs: vec![([(Piece::Pawn, Color::White, 0, false); 4], 0); ACC_STACK_CAP].into_boxed_slice(),
-            top:   0,
+            accs: vec![DualAccumulator::zeroed(); ACC_STACK_CAP].into_boxed_slice(),
+            diffs: vec![([(Piece::Pawn, Color::White, 0, false); 4], 0); ACC_STACK_CAP]
+                .into_boxed_slice(),
+            top: 0,
             clean: 0,
         }
     }
 
-    /// Drop every entry and hand back entry 0 for the caller to fill with a
-    /// full refresh of the current position.
     pub fn reset(&mut self) -> &mut DualAccumulator {
         self.top = 0;
         self.clean = 0;
         &mut self.accs[0]
     }
 
-    /// Record a move's feature diff as a new pending entry. Returns `false`
-    /// when the stack is full; the caller must then rebuild via `reset`.
     #[inline]
     pub fn push(&mut self, feat: &[FeatDelta]) -> bool {
         if self.top + 1 == ACC_STACK_CAP {
@@ -610,9 +585,6 @@ impl AccStack {
         true
     }
 
-    /// Step back to the previous entry. Returns `false` when there is none
-    /// (the stack was reset since the matching `push`); the caller must then
-    /// rebuild via `reset`.
     #[inline]
     pub fn pop(&mut self) -> bool {
         if self.top == 0 {
@@ -623,7 +595,6 @@ impl AccStack {
         true
     }
 
-    /// The current position's accumulators, applying any pending diffs.
     #[inline]
     pub fn current(&mut self, net: &Net) -> &DualAccumulator {
         while self.clean < self.top {
@@ -637,25 +608,18 @@ impl AccStack {
     }
 }
 
-/// Forward pass from a pair of accumulators, relative to `stm`.
 pub fn evaluate_with_net(net: &Net, acc: &DualAccumulator, stm: Color) -> i32 {
     let (us, them) = match stm {
         Color::White => (&acc.white, &acc.black),
         Color::Black => (&acc.black, &acc.white),
     };
 
-    let sum: i64 = screlu_dot(&us.v, &net.l1w[..HL])
-        + screlu_dot(&them.v, &net.l1w[HL..2 * HL]);
+    let sum: i64 = screlu_dot(&us.v, &net.l1w[..HL]) + screlu_dot(&them.v, &net.l1w[HL..2 * HL]);
 
     let out = (sum / QA + net.l1b as i64) * SCALE / (QA * QB);
     out as i32
 }
 
-/// Engine-wide static evaluation entry point. Reads the board's own net
-/// snapshot -- no synchronisation -- and brings the board's lazy
-/// accumulators up to date first (hence `&mut`). Panics if no net is loaded,
-/// which is structurally unreachable (main() installs one at startup, before
-/// any `Board` is built).
 pub fn evaluate(board: &mut Board) -> i32 {
     let stm = board.side;
     let (net, acc) = board.nnue_state().expect("NNUE net not loaded");
@@ -672,14 +636,11 @@ mod tests {
 
     #[test]
     fn embedded_net_parses() {
-
         assert!(parse_net(EMBEDDED_NET).is_ok());
     }
 
-    /// The SIMD kernels must be bit-identical to the scalar reference.
     #[test]
     fn simd_matches_scalar() {
-
         let mut s: u64 = 0x9E3779B97F4A7C15;
         let mut next = || {
             s ^= s << 13;
@@ -689,7 +650,6 @@ mod tests {
         };
 
         for trial in 0..64 {
-
             let mut acc_ref = [0i16; HL];
             let mut acc_simd = [0i16; HL];
             for h in 0..HL {
@@ -703,8 +663,17 @@ mod tests {
 
             let sub = trial & 1 == 0;
             acc_addsub_scalar(&mut acc_ref, &row, sub);
-            if sub { acc_sub(&mut acc_simd, &row) } else { acc_add(&mut acc_simd, &row) }
-            assert_eq!(acc_ref, acc_simd, "acc_{} mismatch on trial {trial}", if sub {"sub"} else {"add"});
+            if sub {
+                acc_sub(&mut acc_simd, &row)
+            } else {
+                acc_add(&mut acc_simd, &row)
+            }
+            assert_eq!(
+                acc_ref,
+                acc_simd,
+                "acc_{} mismatch on trial {trial}",
+                if sub { "sub" } else { "add" }
+            );
 
             let d_ref = screlu_dot_scalar(&acc_ref, &w);
             let d_simd = screlu_dot(&acc_ref, &w);
@@ -712,9 +681,6 @@ mod tests {
         }
     }
 
-    /// End-to-end: the fused i16 forward pass equals a full-precision i64
-    /// `c*c*w` reference. Holds bit-exactly for a `parse_net`-validated net
-    /// (its l1w bound guarantees `c*w` never overflows i16).
     #[test]
     fn forward_pass_matches_scalar() {
         load_embedded();
@@ -744,7 +710,6 @@ mod tests {
         }
     }
 
-    /// The board's lazy accumulators must equal a from-scratch refresh.
     fn assert_acc_fresh(b: &mut Board) {
         let sq_piece = b.sq_piece;
         let (net, acc) = b.nnue_state().unwrap();
@@ -753,9 +718,6 @@ mod tests {
         assert!(*acc == want, "lazy accumulator differs from a full refresh");
     }
 
-    /// Walk the move tree reading the accumulators only at some nodes, so
-    /// pending chains of every length build up and are resolved both on the
-    /// way down and after unmakes.
     fn lazy_walk(b: &mut Board, depth: u32, visited: &mut u64) {
         use crate::movegen::MoveGen;
         use crate::moves::MoveList;
@@ -783,9 +745,7 @@ mod tests {
     fn lazy_accumulators_match_refresh() {
         load_embedded();
         for fen in [
-
             "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-
             "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
         ] {
             let mut b = board_from(fen);
@@ -795,8 +755,6 @@ mod tests {
         }
     }
 
-    /// A line longer than the stack rebuilds instead of overflowing, and
-    /// unmaking back through the rebuild stays correct.
     #[test]
     fn lazy_accumulators_survive_a_full_stack() {
         load_embedded();
@@ -845,9 +803,16 @@ mod tests {
     #[test]
     fn color_flip_symmetry() {
         load_embedded();
-        let a = evaluate(&mut board_from("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 0 1"));
-        let b = evaluate(&mut board_from("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2N2N2/PPPP1PPP/R1BQK2R b KQkq - 0 1"));
+        let a = evaluate(&mut board_from(
+            "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2N2N2/PPPP1PPP/R1BQK2R w KQkq - 0 1",
+        ));
+        let b = evaluate(&mut board_from(
+            "r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2N2N2/PPPP1PPP/R1BQK2R b KQkq - 0 1",
+        ));
 
-        assert!(a.abs() < 200 && b.abs() < 200, "symmetric position evals {a} / {b} not small");
+        assert!(
+            a.abs() < 200 && b.abs() < 200,
+            "symmetric position evals {a} / {b} not small"
+        );
     }
 }

@@ -5,20 +5,39 @@ use crate::moves::{Move, MoveFlag};
 use crate::zobrist::ZOBRIST;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Color { White = 0, Black = 1 }
+pub enum Color {
+    White = 0,
+    Black = 1,
+}
 
 impl Color {
-    #[inline] pub fn flip(self) -> Self {
-        if self == Color::White { Color::Black } else { Color::White }
+    #[inline]
+    pub fn flip(self) -> Self {
+        if self == Color::White {
+            Color::Black
+        } else {
+            Color::White
+        }
     }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Piece { Pawn = 0, Knight = 1, Bishop = 2, Rook = 3, Queen = 4, King = 5 }
+pub enum Piece {
+    Pawn = 0,
+    Knight = 1,
+    Bishop = 2,
+    Rook = 3,
+    Queen = 4,
+    King = 5,
+}
 
 impl Piece {
     pub fn from_char(c: char) -> Option<(Piece, Color)> {
-        let color = if c.is_uppercase() { Color::White } else { Color::Black };
+        let color = if c.is_uppercase() {
+            Color::White
+        } else {
+            Color::Black
+        };
         let piece = match c.to_ascii_lowercase() {
             'p' => Piece::Pawn,
             'n' => Piece::Knight,
@@ -26,78 +45,98 @@ impl Piece {
             'r' => Piece::Rook,
             'q' => Piece::Queen,
             'k' => Piece::King,
-            _   => return None,
+            _ => return None,
         };
         Some((piece, color))
     }
     pub fn to_char(self, color: Color) -> char {
         let c = match self {
-            Piece::Pawn   => 'p',
+            Piece::Pawn => 'p',
             Piece::Knight => 'n',
             Piece::Bishop => 'b',
-            Piece::Rook   => 'r',
-            Piece::Queen  => 'q',
-            Piece::King   => 'k',
+            Piece::Rook => 'r',
+            Piece::Queen => 'q',
+            Piece::King => 'k',
         };
-        if color == Color::White { c.to_ascii_uppercase() } else { c }
+        if color == Color::White {
+            c.to_ascii_uppercase()
+        } else {
+            c
+        }
     }
 }
 
-pub const CASTLE_WK: u8 = 1;
-pub const CASTLE_WQ: u8 = 2;
-pub const CASTLE_BK: u8 = 4;
-pub const CASTLE_BQ: u8 = 8;
+pub static CHESS960: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Copy, Clone, Default)]
+pub struct CastleInfo {
+    pub king: u8,
+    pub rook: u8,
+    pub king_to: u8,
+    pub rook_to: u8,
+
+    pub empty: Bitboard,
+
+    pub safe: Bitboard,
+}
+
+#[inline]
+pub fn castle_index(us: Color, flags: MoveFlag) -> usize {
+    us as usize * 2 + (flags == MoveFlag::CastleQueen) as usize
+}
 
 use crate::nnue::FeatDelta;
 
 #[derive(Copy, Clone)]
 pub struct IrrevState {
-    pub captured:    Option<Piece>,
-    pub ep_sq:       Option<u8>,
-    pub castling:    u8,
-    pub halfmove:    u16,
-    pub hash:        u64,
+    pub captured: Option<Piece>,
+    pub ep_sq: Option<u8>,
+    pub castling: u8,
+    pub halfmove: u16,
+    pub hash: u64,
 }
 
-/// Cheap to clone: the attack tables are process-wide statics, so a clone is
-/// the bitboards, the move history and the NNUE accumulator stack.
 #[derive(Clone)]
 pub struct Board {
-    /// pieces[color][piece]
-    pub pieces:   [[Bitboard; 6]; 2],
-    /// color_bb[color] = union of all pieces of that color
+    pub pieces: [[Bitboard; 6]; 2],
+
     pub color_bb: [Bitboard; 2],
-    /// piece on each square (for fast lookup during unmake / eval)
+
     pub sq_piece: [Option<(Piece, Color)>; 64],
 
-    pub side:       Color,
-    pub ep_sq:      Option<u8>,
-    pub castling:   u8,
-    pub halfmove:   u16,
-    pub fullmove:   u16,
-    pub hash:       u64,
+    pub side: Color,
+    pub ep_sq: Option<u8>,
+    pub castling: u8,
+    pub halfmove: u16,
+    pub fullmove: u16,
+    pub hash: u64,
 
-    pub history:    Vec<(Move, IrrevState)>,
+    pub castle: [CastleInfo; 4],
+    castle_mask: [u8; 64],
 
-    nnue_stack:      crate::nnue::AccStack,
-    net:             Option<Arc<crate::nnue::Net>>,
+    pub history: Vec<(Move, IrrevState)>,
+
+    nnue_stack: crate::nnue::AccStack,
+    net: Option<Arc<crate::nnue::Net>>,
 }
 
 impl Board {
     pub fn empty() -> Self {
         Board {
-            pieces:   [[0; 6]; 2],
+            pieces: [[0; 6]; 2],
             color_bb: [0; 2],
             sq_piece: [None; 64],
-            side:     Color::White,
-            ep_sq:    None,
+            side: Color::White,
+            ep_sq: None,
             castling: 0,
             halfmove: 0,
             fullmove: 1,
-            hash:     0,
-            history:  Vec::new(),
-            nnue_stack:  crate::nnue::AccStack::new(),
-            net:         crate::nnue::current_net(),
+            hash: 0,
+            castle: [CastleInfo::default(); 4],
+            castle_mask: [0xFF; 64],
+            history: Vec::new(),
+            nnue_stack: crate::nnue::AccStack::new(),
+            net: crate::nnue::current_net(),
         }
     }
 
@@ -105,7 +144,10 @@ impl Board {
         Self::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap()
     }
 
-    #[inline] pub fn occupied(&self) -> Bitboard { self.color_bb[0] | self.color_bb[1] }
+    #[inline]
+    pub fn occupied(&self) -> Bitboard {
+        self.color_bb[0] | self.color_bb[1]
+    }
 
     #[inline]
     pub fn piece_bb(&self, color: Color, piece: Piece) -> Bitboard {
@@ -132,10 +174,6 @@ impl Board {
         }
     }
 
-    /// The board's own net snapshot and this position's accumulators, or
-    /// `None` if no net was installed when this board was built. Brings the
-    /// lazy accumulator stack up to date; otherwise plain field reads, no
-    /// synchronisation. Used by `nnue::evaluate`.
     #[inline]
     pub fn nnue_state(&mut self) -> Option<(&crate::nnue::Net, &crate::nnue::DualAccumulator)> {
         let net = self.net.as_deref()?;
@@ -145,41 +183,49 @@ impl Board {
         {
             let mut check = crate::nnue::DualAccumulator::zeroed();
             crate::nnue::refresh_all(net, &self.sq_piece, &mut check);
-            debug_assert_eq!(check.white.v, acc.white.v, "lazy NNUE accumulator (White) desynced from a full refresh");
-            debug_assert_eq!(check.black.v, acc.black.v, "lazy NNUE accumulator (Black) desynced from a full refresh");
+            debug_assert_eq!(
+                check.white.v, acc.white.v,
+                "lazy NNUE accumulator (White) desynced from a full refresh"
+            );
+            debug_assert_eq!(
+                check.black.v, acc.black.v,
+                "lazy NNUE accumulator (Black) desynced from a full refresh"
+            );
         }
 
         Some((net, acc))
     }
 
-    /// Re-take the global net snapshot and rebuild the accumulators from it.
-    /// Called by the UCI layer after a runtime EvalFile swap so this board
-    /// stops evaluating with the previous net's weights.
     pub fn reload_net(&mut self) {
         self.net = crate::nnue::current_net();
         self.refresh_nnue();
     }
 
-    /// Full recompute of both NNUE accumulators from the current board
-    /// state, as the new base of the accumulator stack. O(pieces) — called
-    /// once per FEN parse (see `from_fen`), by `reload_net`, and at the root
-    /// of each search. Every move after that is handled incrementally.
     pub fn refresh_nnue(&mut self) {
-        let Some(net) = self.net.as_deref() else { return };
+        let Some(net) = self.net.as_deref() else {
+            return;
+        };
         crate::nnue::refresh_all(net, &self.sq_piece, self.nnue_stack.reset());
     }
 
     pub fn from_fen(fen: &str) -> Option<Self> {
         let mut board = Board::empty();
         let parts: Vec<&str> = fen.split_whitespace().collect();
-        if parts.len() < 4 { return None; }
+        if parts.len() < 4 {
+            return None;
+        }
 
         let mut rank: i32 = 7;
         let mut file: i32 = 0;
         for c in parts[0].chars() {
             match c {
-                '/' => { rank -= 1; file = 0; }
-                '1'..='8' => { file += (c as i32) - ('0' as i32); }
+                '/' => {
+                    rank -= 1;
+                    file = 0;
+                }
+                '1'..='8' => {
+                    file += (c as i32) - ('0' as i32);
+                }
                 _ => {
                     if let Some((piece, color)) = Piece::from_char(c) {
                         let sq = (rank * 8 + file) as u8;
@@ -190,17 +236,60 @@ impl Board {
             }
         }
 
-        board.side = if parts[1] == "b" { Color::Black } else { Color::White };
+        board.side = if parts[1] == "b" {
+            Color::Black
+        } else {
+            Color::White
+        };
 
         board.castling = 0;
         for c in parts[2].chars() {
-            match c {
-                'K' => board.castling |= CASTLE_WK,
-                'Q' => board.castling |= CASTLE_WQ,
-                'k' => board.castling |= CASTLE_BK,
-                'q' => board.castling |= CASTLE_BQ,
-                _ => {}
+            let color = if c.is_ascii_uppercase() {
+                Color::White
+            } else {
+                Color::Black
+            };
+            let base = if color == Color::White { 0u8 } else { 56 };
+            let kings = board.pieces[color as usize][Piece::King as usize] & (0xFFu64 << base);
+            if kings == 0 {
+                continue;
             }
+            let king = lsb(kings);
+            let kfile = king & 7;
+            let rook_on = |f: u8| board.sq_piece[(base + f) as usize] == Some((Piece::Rook, color));
+            let rook_file = match c.to_ascii_lowercase() {
+                'k' => (kfile + 1..8).rev().find(|&f| rook_on(f)).unwrap_or(7),
+                'q' => (0..kfile).find(|&f| rook_on(f)).unwrap_or(0),
+                f @ 'a'..='h' => f as u8 - b'a',
+                _ => continue,
+            };
+            if rook_file == kfile {
+                continue;
+            }
+            let queen_side = rook_file < kfile;
+            let idx = color as usize * 2 + queen_side as usize;
+            let rook = base + rook_file;
+            let (king_to, rook_to) = if queen_side {
+                (base + 2, base + 3)
+            } else {
+                (base + 6, base + 5)
+            };
+            board.castling |= 1 << idx;
+            board.castle[idx] = CastleInfo {
+                king,
+                rook,
+                king_to,
+                rook_to,
+                empty: (between(king, king_to)
+                    | bit(king_to)
+                    | between(rook, rook_to)
+                    | bit(rook_to))
+                    & !bit(king)
+                    & !bit(rook),
+                safe: between(king, king_to) | bit(king) | bit(king_to),
+            };
+            board.castle_mask[rook as usize] &= !(1 << idx);
+            board.castle_mask[king as usize] &= !(3 << (color as usize * 2));
         }
 
         board.ep_sq = str_to_sq(parts[3]);
@@ -208,9 +297,13 @@ impl Board {
         board.halfmove = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
         board.fullmove = parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(1);
 
-        if board.side == Color::Black { board.hash ^= ZOBRIST.side; }
+        if board.side == Color::Black {
+            board.hash ^= ZOBRIST.side;
+        }
         for i in 0..4 {
-            if board.castling & (1 << i) != 0 { board.hash ^= ZOBRIST.castle[i]; }
+            if board.castling & (1 << i) != 0 {
+                board.hash ^= ZOBRIST.castle[i];
+            }
         }
         if let Some(ep) = board.ep_sq {
             board.hash ^= ZOBRIST.ep_file[(ep & 7) as usize];
@@ -222,21 +315,27 @@ impl Board {
     }
 
     pub fn to_fen(&self) -> String {
-
         let mut fen = String::new();
         for rank in (0..8).rev() {
             let mut empty = 0u8;
             for file in 0..8 {
                 let sq = rank * 8 + file;
                 if let Some((piece, color)) = self.sq_piece[sq as usize] {
-                    if empty > 0 { fen.push((b'0' + empty) as char); empty = 0; }
+                    if empty > 0 {
+                        fen.push((b'0' + empty) as char);
+                        empty = 0;
+                    }
                     fen.push(piece.to_char(color));
                 } else {
                     empty += 1;
                 }
             }
-            if empty > 0 { fen.push((b'0' + empty) as char); }
-            if rank > 0 { fen.push('/'); }
+            if empty > 0 {
+                fen.push((b'0' + empty) as char);
+            }
+            if rank > 0 {
+                fen.push('/');
+            }
         }
         fen.push(' ');
         fen.push(if self.side == Color::White { 'w' } else { 'b' });
@@ -244,10 +343,32 @@ impl Board {
         if self.castling == 0 {
             fen.push('-');
         } else {
-            if self.castling & CASTLE_WK != 0 { fen.push('K'); }
-            if self.castling & CASTLE_WQ != 0 { fen.push('Q'); }
-            if self.castling & CASTLE_BK != 0 { fen.push('k'); }
-            if self.castling & CASTLE_BQ != 0 { fen.push('q'); }
+            for idx in 0..4 {
+                if self.castling & (1 << idx) == 0 {
+                    continue;
+                }
+                let color = if idx < 2 { Color::White } else { Color::Black };
+                let rook = self.castle[idx].rook;
+                let (base, file) = (rook & !7, rook & 7);
+                let rooks = self.pieces[color as usize][Piece::Rook as usize] & (0xFFu64 << base);
+                let shadowed = if idx % 2 == 0 {
+                    rooks >> rook > 1
+                } else {
+                    rooks & (bit(rook) - 1) != 0
+                };
+                let c = if shadowed {
+                    (b'a' + file) as char
+                } else if idx % 2 == 0 {
+                    'k'
+                } else {
+                    'q'
+                };
+                fen.push(if color == Color::White {
+                    c.to_ascii_uppercase()
+                } else {
+                    c
+                });
+            }
         }
         fen.push(' ');
         match self.ep_sq {
@@ -262,27 +383,29 @@ impl Board {
         self.make_move_impl(mv, true);
     }
 
-    /// Make a move without any NNUE accumulator bookkeeping, for the test-only
-    /// make/unmake reference move generator. MUST be paired with
-    /// `unmake_move_no_nnue`.
     #[cfg(test)]
     pub(crate) fn make_move_no_nnue(&mut self, mv: Move) {
         self.make_move_impl(mv, false);
     }
 
     fn make_move_impl(&mut self, mv: Move, update_nnue: bool) {
-        let from  = mv.from();
-        let to    = mv.to();
+        let from = mv.from();
+        let to = mv.to();
         let flags = mv.flags();
-        let us    = self.side;
-        let them  = us.flip();
+        let us = self.side;
+        let them = us.flip();
 
+        let is_castle = matches!(flags, MoveFlag::CastleKing | MoveFlag::CastleQueen);
         let irrev = IrrevState {
-            captured: self.sq_piece[to as usize].map(|(p, _)| p),
-            ep_sq:    self.ep_sq,
+            captured: if is_castle {
+                None
+            } else {
+                self.sq_piece[to as usize].map(|(p, _)| p)
+            },
+            ep_sq: self.ep_sq,
             castling: self.castling,
             halfmove: self.halfmove,
-            hash:     self.hash,
+            hash: self.hash,
         };
 
         let (moving_piece, _) = self.sq_piece[from as usize].unwrap();
@@ -290,7 +413,8 @@ impl Board {
         let mut feat: [FeatDelta; 4] = [(Piece::Pawn, Color::White, 0, false); 4];
         let mut nfeat = 0usize;
 
-        feat[nfeat] = (moving_piece, us, from, false); nfeat += 1;
+        feat[nfeat] = (moving_piece, us, from, false);
+        nfeat += 1;
 
         if moving_piece == Piece::Pawn || mv.is_capture() || mv.is_promotion() {
             self.halfmove = 0;
@@ -309,64 +433,83 @@ impl Board {
         match flags {
             MoveFlag::Quiet | MoveFlag::Capture => {
                 if let Some(cp) = irrev.captured {
-                    feat[nfeat] = (cp, them, to, false); nfeat += 1;
+                    feat[nfeat] = (cp, them, to, false);
+                    nfeat += 1;
                 }
                 self.clear_piece(to);
                 self.set_piece(to, moving_piece, us);
-                feat[nfeat] = (moving_piece, us, to, true); nfeat += 1;
+                feat[nfeat] = (moving_piece, us, to, true);
+                nfeat += 1;
             }
             MoveFlag::DoublePush => {
                 self.set_piece(to, moving_piece, us);
-                feat[nfeat] = (moving_piece, us, to, true); nfeat += 1;
+                feat[nfeat] = (moving_piece, us, to, true);
+                nfeat += 1;
 
                 let ep = if us == Color::White { to - 8 } else { to + 8 };
                 self.ep_sq = Some(ep);
                 self.hash ^= ZOBRIST.ep_file[(ep & 7) as usize];
             }
-            MoveFlag::CastleKing => {
+            MoveFlag::CastleKing | MoveFlag::CastleQueen => {
+                let c = self.castle[castle_index(us, flags)];
+                self.clear_piece(c.rook);
                 self.set_piece(to, Piece::King, us);
-                feat[nfeat] = (Piece::King, us, to, true); nfeat += 1;
-                let (rook_from, rook_to) = if us == Color::White { (sq::H1, sq::F1) } else { (sq::H8, sq::F8) };
-                self.clear_piece(rook_from);
-                feat[nfeat] = (Piece::Rook, us, rook_from, false); nfeat += 1;
-                self.set_piece(rook_to, Piece::Rook, us);
-                feat[nfeat] = (Piece::Rook, us, rook_to, true); nfeat += 1;
-            }
-            MoveFlag::CastleQueen => {
-                self.set_piece(to, Piece::King, us);
-                feat[nfeat] = (Piece::King, us, to, true); nfeat += 1;
-                let (rook_from, rook_to) = if us == Color::White { (sq::A1, sq::D1) } else { (sq::A8, sq::D8) };
-                self.clear_piece(rook_from);
-                feat[nfeat] = (Piece::Rook, us, rook_from, false); nfeat += 1;
-                self.set_piece(rook_to, Piece::Rook, us);
-                feat[nfeat] = (Piece::Rook, us, rook_to, true); nfeat += 1;
+                feat[nfeat] = (Piece::King, us, to, true);
+                nfeat += 1;
+                feat[nfeat] = (Piece::Rook, us, c.rook, false);
+                nfeat += 1;
+                self.set_piece(c.rook_to, Piece::Rook, us);
+                feat[nfeat] = (Piece::Rook, us, c.rook_to, true);
+                nfeat += 1;
             }
             MoveFlag::EnPassant => {
                 let cap_sq = if us == Color::White { to - 8 } else { to + 8 };
-                feat[nfeat] = (Piece::Pawn, them, cap_sq, false); nfeat += 1;
+                feat[nfeat] = (Piece::Pawn, them, cap_sq, false);
+                nfeat += 1;
                 self.clear_piece(cap_sq);
                 self.set_piece(to, Piece::Pawn, us);
-                feat[nfeat] = (Piece::Pawn, us, to, true); nfeat += 1;
+                feat[nfeat] = (Piece::Pawn, us, to, true);
+                nfeat += 1;
             }
             MoveFlag::PromKnight | MoveFlag::PromKnightCapture => {
-                if let Some(cp) = irrev.captured { feat[nfeat] = (cp, them, to, false); nfeat += 1; }
-                self.clear_piece(to); self.set_piece(to, Piece::Knight, us);
-                feat[nfeat] = (Piece::Knight, us, to, true); nfeat += 1;
+                if let Some(cp) = irrev.captured {
+                    feat[nfeat] = (cp, them, to, false);
+                    nfeat += 1;
+                }
+                self.clear_piece(to);
+                self.set_piece(to, Piece::Knight, us);
+                feat[nfeat] = (Piece::Knight, us, to, true);
+                nfeat += 1;
             }
             MoveFlag::PromBishop | MoveFlag::PromBishopCapture => {
-                if let Some(cp) = irrev.captured { feat[nfeat] = (cp, them, to, false); nfeat += 1; }
-                self.clear_piece(to); self.set_piece(to, Piece::Bishop, us);
-                feat[nfeat] = (Piece::Bishop, us, to, true); nfeat += 1;
+                if let Some(cp) = irrev.captured {
+                    feat[nfeat] = (cp, them, to, false);
+                    nfeat += 1;
+                }
+                self.clear_piece(to);
+                self.set_piece(to, Piece::Bishop, us);
+                feat[nfeat] = (Piece::Bishop, us, to, true);
+                nfeat += 1;
             }
             MoveFlag::PromRook | MoveFlag::PromRookCapture => {
-                if let Some(cp) = irrev.captured { feat[nfeat] = (cp, them, to, false); nfeat += 1; }
-                self.clear_piece(to); self.set_piece(to, Piece::Rook, us);
-                feat[nfeat] = (Piece::Rook, us, to, true); nfeat += 1;
+                if let Some(cp) = irrev.captured {
+                    feat[nfeat] = (cp, them, to, false);
+                    nfeat += 1;
+                }
+                self.clear_piece(to);
+                self.set_piece(to, Piece::Rook, us);
+                feat[nfeat] = (Piece::Rook, us, to, true);
+                nfeat += 1;
             }
             MoveFlag::PromQueen | MoveFlag::PromQueenCapture => {
-                if let Some(cp) = irrev.captured { feat[nfeat] = (cp, them, to, false); nfeat += 1; }
-                self.clear_piece(to); self.set_piece(to, Piece::Queen, us);
-                feat[nfeat] = (Piece::Queen, us, to, true); nfeat += 1;
+                if let Some(cp) = irrev.captured {
+                    feat[nfeat] = (cp, them, to, false);
+                    nfeat += 1;
+                }
+                self.clear_piece(to);
+                self.set_piece(to, Piece::Queen, us);
+                feat[nfeat] = (Piece::Queen, us, to, true);
+                nfeat += 1;
             }
         }
 
@@ -375,17 +518,21 @@ impl Board {
         }
 
         let old_castling = self.castling;
-        self.castling &= CASTLING_RIGHTS_MASK[from as usize];
-        self.castling &= CASTLING_RIGHTS_MASK[to   as usize];
+        self.castling &= self.castle_mask[from as usize];
+        self.castling &= self.castle_mask[to as usize];
 
         let changed = old_castling ^ self.castling;
         for i in 0..4u8 {
-            if changed & (1 << i) != 0 { self.hash ^= ZOBRIST.castle[i as usize]; }
+            if changed & (1 << i) != 0 {
+                self.hash ^= ZOBRIST.castle[i as usize];
+            }
         }
 
         self.hash ^= ZOBRIST.side;
 
-        if us == Color::Black { self.fullmove += 1; }
+        if us == Color::Black {
+            self.fullmove += 1;
+        }
 
         self.side = them;
         self.history.push((mv, irrev));
@@ -395,7 +542,6 @@ impl Board {
         self.unmake_move_impl(true);
     }
 
-    /// Counterpart to `make_move_no_nnue` -- must always be paired with it.
     #[cfg(test)]
     pub(crate) fn unmake_move_no_nnue(&mut self) {
         self.unmake_move_impl(false);
@@ -404,19 +550,21 @@ impl Board {
     fn unmake_move_impl(&mut self, update_nnue: bool) {
         let (mv, irrev) = match self.history.pop() {
             Some(x) => x,
-            None    => return,
+            None => return,
         };
 
-        let from  = mv.from();
-        let to    = mv.to();
+        let from = mv.from();
+        let to = mv.to();
         let flags = mv.flags();
 
         self.side = self.side.flip();
-        let us    = self.side;
+        let us = self.side;
 
-        if us == Color::Black { self.fullmove -= 1; }
+        if us == Color::Black {
+            self.fullmove -= 1;
+        }
 
-        self.ep_sq    = irrev.ep_sq;
+        self.ep_sq = irrev.ep_sq;
         self.castling = irrev.castling;
         self.halfmove = irrev.halfmove;
 
@@ -429,22 +577,19 @@ impl Board {
                 if let Some(cap) = irrev.captured {
                     self.set_piece(to, cap, us.flip());
                 }
-                let restore = if flags == MoveFlag::DoublePush { Piece::Pawn } else { moved_piece };
+                let restore = if flags == MoveFlag::DoublePush {
+                    Piece::Pawn
+                } else {
+                    moved_piece
+                };
                 self.set_piece(from, restore, us);
             }
-            MoveFlag::CastleKing => {
+            MoveFlag::CastleKing | MoveFlag::CastleQueen => {
+                let c = self.castle[castle_index(us, flags)];
                 self.clear_piece(to);
+                self.clear_piece(c.rook_to);
                 self.set_piece(from, Piece::King, us);
-                let (rook_from, rook_to) = if us == Color::White { (sq::H1, sq::F1) } else { (sq::H8, sq::F8) };
-                self.clear_piece(rook_to);
-                self.set_piece(rook_from, Piece::Rook, us);
-            }
-            MoveFlag::CastleQueen => {
-                self.clear_piece(to);
-                self.set_piece(from, Piece::King, us);
-                let (rook_from, rook_to) = if us == Color::White { (sq::A1, sq::D1) } else { (sq::A8, sq::D8) };
-                self.clear_piece(rook_to);
-                self.set_piece(rook_from, Piece::Rook, us);
+                self.set_piece(c.rook, Piece::Rook, us);
             }
             MoveFlag::EnPassant => {
                 self.clear_piece(to);
@@ -453,12 +598,17 @@ impl Board {
                 self.set_piece(cap_sq, Piece::Pawn, us.flip());
             }
 
-            MoveFlag::PromKnight | MoveFlag::PromBishop | MoveFlag::PromRook | MoveFlag::PromQueen => {
+            MoveFlag::PromKnight
+            | MoveFlag::PromBishop
+            | MoveFlag::PromRook
+            | MoveFlag::PromQueen => {
                 self.clear_piece(to);
                 self.set_piece(from, Piece::Pawn, us);
             }
-            MoveFlag::PromKnightCapture | MoveFlag::PromBishopCapture
-            | MoveFlag::PromRookCapture | MoveFlag::PromQueenCapture => {
+            MoveFlag::PromKnightCapture
+            | MoveFlag::PromBishopCapture
+            | MoveFlag::PromRookCapture
+            | MoveFlag::PromQueenCapture => {
                 self.clear_piece(to);
                 if let Some(cap) = irrev.captured {
                     self.set_piece(to, cap, us.flip());
@@ -474,17 +624,11 @@ impl Board {
         }
     }
 
-    /// Is `sq` attacked by `attacker` color, given the current occupancy?
     #[inline]
     pub fn is_attacked(&self, sq: u8, attacker: Color) -> bool {
         self.is_attacked_occ(sq, attacker, self.occupied())
     }
 
-    /// Bitboard of every `by`-colored piece that attacks `sq` under the
-    /// supplied occupancy. `occ` is passed explicitly so callers can probe a
-    /// hypothetical position (e.g. king removed, for king-move legality, or
-    /// two pawns removed, for the en-passant discovered-check test) without
-    /// mutating the board.
     pub fn attackers_to(&self, sq: u8, by: Color, occ: Bitboard) -> Bitboard {
         let c = by as usize;
         let target = bit(sq);
@@ -504,7 +648,6 @@ impl Board {
                 & (self.pieces[c][Piece::Rook as usize] | self.pieces[c][Piece::Queen as usize]))
     }
 
-    /// Is `sq` attacked by `attacker` color under the supplied occupancy?
     pub fn is_attacked_occ(&self, sq: u8, attacker: Color, occ: Bitboard) -> bool {
         let a = attacker as usize;
 
@@ -514,19 +657,29 @@ impl Board {
         } else {
             ((pawns >> 7) & NOT_FILE_A) | ((pawns >> 9) & NOT_FILE_H)
         };
-        if pawn_attacks & bit(sq) != 0 { return true; }
+        if pawn_attacks & bit(sq) != 0 {
+            return true;
+        }
 
-        if KNIGHT_ATTACKS[sq as usize] & self.pieces[a][Piece::Knight as usize] != 0 { return true; }
+        if KNIGHT_ATTACKS[sq as usize] & self.pieces[a][Piece::Knight as usize] != 0 {
+            return true;
+        }
 
-        if KING_ATTACKS[sq as usize] & self.pieces[a][Piece::King as usize] != 0 { return true; }
+        if KING_ATTACKS[sq as usize] & self.pieces[a][Piece::King as usize] != 0 {
+            return true;
+        }
 
-        let diag_attackers = self.pieces[a][Piece::Bishop as usize]
-            | self.pieces[a][Piece::Queen as usize];
-        if MAGICS.bishop_attacks(sq, occ) & diag_attackers != 0 { return true; }
+        let diag_attackers =
+            self.pieces[a][Piece::Bishop as usize] | self.pieces[a][Piece::Queen as usize];
+        if MAGICS.bishop_attacks(sq, occ) & diag_attackers != 0 {
+            return true;
+        }
 
-        let orth_attackers = self.pieces[a][Piece::Rook as usize]
-            | self.pieces[a][Piece::Queen as usize];
-        if MAGICS.rook_attacks(sq, occ) & orth_attackers != 0 { return true; }
+        let orth_attackers =
+            self.pieces[a][Piece::Rook as usize] | self.pieces[a][Piece::Queen as usize];
+        if MAGICS.rook_attacks(sq, occ) & orth_attackers != 0 {
+            return true;
+        }
 
         false
     }
@@ -535,13 +688,8 @@ impl Board {
         lsb(self.pieces[color as usize][Piece::King as usize])
     }
 
-    /// Every square attacked by any piece of `color`, given the current
-    /// occupancy. Used by the search for threat-aware move ordering /
-    /// history (a quiet move that leaves an attacked square, or moves into
-    /// one, is scored differently). This is a cheap union of attack sets,
-    /// not a per-square `is_attacked` loop.
     pub fn attacks_by(&self, color: Color) -> Bitboard {
-        let c   = color as usize;
+        let c = color as usize;
         let occ = self.occupied();
 
         let pawns = self.pieces[c][Piece::Pawn as usize];
@@ -558,7 +706,8 @@ impl Board {
 
         atk |= KING_ATTACKS[self.king_sq(color) as usize];
 
-        let mut diag = self.pieces[c][Piece::Bishop as usize] | self.pieces[c][Piece::Queen as usize];
+        let mut diag =
+            self.pieces[c][Piece::Bishop as usize] | self.pieces[c][Piece::Queen as usize];
         while diag != 0 {
             atk |= MAGICS.bishop_attacks(pop_lsb(&mut diag), occ);
         }
@@ -583,7 +732,7 @@ impl Board {
                 let sq = rank * 8 + file;
                 let s = match self.sq_piece[sq] {
                     Some((p, c)) => format!(" {} ", p.to_char(c)),
-                    None         => "   ".to_string(),
+                    None => "   ".to_string(),
                 };
                 print!("{}|", s);
             }
@@ -591,18 +740,19 @@ impl Board {
             println!("+---+---+---+---+---+---+---+---+");
         }
         println!("  a   b   c   d   e   f   g   h");
-        println!("Side: {:?}  EP: {:?}  Castle: {:04b}",
-            self.side, self.ep_sq, self.castling);
+        println!(
+            "Side: {:?}  EP: {:?}  Castle: {:04b}",
+            self.side, self.ep_sq, self.castling
+        );
     }
 
     pub fn make_null_move(&mut self) {
-
         let irrev = IrrevState {
             captured: None,
-            ep_sq:    self.ep_sq,
+            ep_sq: self.ep_sq,
             castling: self.castling,
             halfmove: self.halfmove,
-            hash:     self.hash,
+            hash: self.hash,
         };
 
         if let Some(ep) = self.ep_sq {
@@ -613,7 +763,9 @@ impl Board {
         self.hash ^= ZOBRIST.side;
         self.side = self.side.flip();
         self.halfmove += 1;
-        if self.side == Color::White { self.fullmove += 1; }
+        if self.side == Color::White {
+            self.fullmove += 1;
+        }
 
         self.history.push((Move::NULL, irrev));
     }
@@ -621,17 +773,18 @@ impl Board {
     pub fn unmake_null_move(&mut self) {
         let (_, irrev) = match self.history.pop() {
             Some(x) => x,
-            None    => return,
+            None => return,
         };
-        self.side     = self.side.flip();
-        self.ep_sq    = irrev.ep_sq;
+        self.side = self.side.flip();
+        self.ep_sq = irrev.ep_sq;
         self.castling = irrev.castling;
         self.halfmove = irrev.halfmove;
-        self.hash     = irrev.hash;
-        if self.side == Color::Black { self.fullmove -= 1; }
+        self.hash = irrev.hash;
+        if self.side == Color::Black {
+            self.fullmove -= 1;
+        }
     }
 
-    /// Apply a sequence of moves from the given position (used by UCI position command)
     pub fn apply_moves(&mut self, move_strs: &[&str]) {
         for ms in move_strs {
             if let Some(mv) = self.find_uci_move(ms) {
@@ -640,7 +793,6 @@ impl Board {
         }
     }
 
-    /// Find the legal move matching a UCI string
     pub fn find_uci_move(&self, uci: &str) -> Option<Move> {
         use crate::movegen::MoveGen;
         let parsed = Move::from_uci(uci)?;
@@ -649,50 +801,67 @@ impl Board {
 
         moves.iter().copied().find(|mv| {
             mv.from() == parsed.from()
-                && mv.to() == parsed.to()
+                && (mv.to() == parsed.to() || self.castle_rook(*mv) == Some(parsed.to()))
                 && mv.promo_piece() == parsed.promo_piece()
         })
     }
-}
 
-/// Castling rights mask per square – if a king/rook moves from these squares,
-/// the corresponding right is revoked.
-const CASTLING_RIGHTS_MASK: [u8; 64] = {
-    let mut m = [0xFFu8; 64];
-    m[sq::E1 as usize] &= !(CASTLE_WK | CASTLE_WQ);
-    m[sq::A1 as usize] &= !CASTLE_WQ;
-    m[sq::H1 as usize] &= !CASTLE_WK;
-    m[sq::E8 as usize] &= !(CASTLE_BK | CASTLE_BQ);
-    m[sq::A8 as usize] &= !CASTLE_BQ;
-    m[sq::H8 as usize] &= !CASTLE_BK;
-    m
-};
+    #[inline]
+    pub(crate) fn castle_rook(&self, mv: Move) -> Option<u8> {
+        let flags = mv.flags();
+        if !matches!(flags, MoveFlag::CastleKing | MoveFlag::CastleQueen) {
+            return None;
+        }
+        let us = if mv.from() < 8 {
+            Color::White
+        } else {
+            Color::Black
+        };
+        Some(self.castle[castle_index(us, flags)].rook)
+    }
+
+    pub fn move_to_uci(&self, mv: Move) -> String {
+        match self.castle_rook(mv) {
+            Some(rook) if CHESS960.load(std::sync::atomic::Ordering::Relaxed) => {
+                format!("{}{}", sq_to_str(mv.from()), sq_to_str(rook))
+            }
+            _ => mv.to_uci(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every under-promotion string must produce that piece (it used to
-    /// resolve to the queen promotion, desyncing the board from the GUI).
     #[test]
     fn uci_underpromotions_resolve_to_the_named_piece() {
         crate::nnue::load_embedded();
-        for (s, piece) in [("n", Piece::Knight), ("b", Piece::Bishop), ("r", Piece::Rook), ("q", Piece::Queen)] {
-
+        for (s, piece) in [
+            ("n", Piece::Knight),
+            ("b", Piece::Bishop),
+            ("r", Piece::Rook),
+            ("q", Piece::Queen),
+        ] {
             for uci in [format!("e7e8{s}"), format!("e7d8{s}")] {
                 let mut b = Board::from_fen("3r3k/4P3/8/8/8/8/8/K7 w - - 0 1").unwrap();
                 b.apply_moves(&[uci.as_str()]);
-                assert_eq!(b.sq_piece[bit_index(&uci[2..4])], Some((piece, Color::White)), "{uci}");
+                assert_eq!(
+                    b.sq_piece[bit_index(&uci[2..4])],
+                    Some((piece, Color::White)),
+                    "{uci}"
+                );
                 assert_eq!(b.side, Color::Black, "{uci} was not applied");
             }
         }
     }
 
-    /// Regression: the game where the engine then played an illegal move.
     #[test]
     fn knight_underpromotion_from_a_real_game() {
         crate::nnue::load_embedded();
-        let mut b = Board::from_fen("rnbqkbnr/pppp1pp1/4p3/7p/4P3/5P2/PPPPK1PP/RNBQ1BNR w kq - 0 4").unwrap();
+        let mut b =
+            Board::from_fen("rnbqkbnr/pppp1pp1/4p3/7p/4P3/5P2/PPPPK1PP/RNBQ1BNR w kq - 0 4")
+                .unwrap();
         let moves = "e2e1 c7c5 d2d4 d7d5 e4d5 e6d5 f1b5 c8d7 b5d7 d8d7 b1c3 c5d4 d1d4 g8e7 g1e2 \
             b8c6 d4d3 e8c8 c1f4 d5d4 c3e4 e7g6 a2a3 g6f4 e2f4 d7c7 f4e2 c6e5 d3b3 d4d3 f3f4 d3e2 \
             f4e5 d8e8 e4g5 f8c5 g5f3 g7g5 f3g5 c7e5 g5f3 e5e7 b3c4 c8b8 c4f4 b8a8 g2g3 h8g8 f4d2 \
@@ -700,7 +869,10 @@ mod tests {
         let list: Vec<&str> = moves.split_whitespace().collect();
         b.apply_moves(&list);
         assert_eq!(b.history.len(), list.len(), "every move must apply");
-        assert_eq!(b.sq_piece[sq::E1 as usize], Some((Piece::Knight, Color::Black)));
+        assert_eq!(
+            b.sq_piece[sq::E1 as usize],
+            Some((Piece::Knight, Color::Black))
+        );
     }
 
     fn bit_index(s: &str) -> usize {
@@ -712,10 +884,6 @@ mod tests {
 mod hash_tests {
     use super::*;
 
-    /// After make + unmake the hash must be exactly what it was, and after a
-    /// make it must equal the hash of the same position built from its FEN.
-    /// (unmake used to restore the hash before moving the pieces back, which
-    /// XOR'd piece keys into it and left it corrupted.)
     #[test]
     fn hash_survives_make_unmake() {
         crate::nnue::load_embedded();
@@ -732,9 +900,19 @@ mod hash_tests {
             for &mv in moves.iter() {
                 b.make_move(mv);
                 let want = Board::from_fen(&b.to_fen()).unwrap().hash;
-                assert_eq!(b.hash, want, "{fen}: hash after {} differs from its FEN's", mv.to_uci());
+                assert_eq!(
+                    b.hash,
+                    want,
+                    "{fen}: hash after {} differs from its FEN's",
+                    mv.to_uci()
+                );
                 b.unmake_move();
-                assert_eq!(b.hash, root, "{fen}: hash not restored after unmaking {}", mv.to_uci());
+                assert_eq!(
+                    b.hash,
+                    root,
+                    "{fen}: hash not restored after unmaking {}",
+                    mv.to_uci()
+                );
             }
         }
     }

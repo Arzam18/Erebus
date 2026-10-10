@@ -1,130 +1,58 @@
-//! Polyglot opening book probing.
-//!
-//! A Polyglot `.bin` book is a flat array of 16-byte big-endian entries
-//! `key:u64 | move:u16 | weight:u16 | learn:u32`, sorted by key. The key is
-//! the Polyglot Zobrist hash of the position, which shakmaty's `Zobrist64`
-//! reproduces exactly (shakmaty tests it against the Polyglot reference keys).
-//!
-//! Move encoding: bits 0-5 to-square, 6-11 from-square (a1 = 0 ... h8 = 63,
-//! same as the engine), 12-14 promotion (1 = N, 2 = B, 3 = R, 4 = Q).
-//! Castling is stored as king-takes-own-rook (`e1h1`), which we translate to
-//! the engine's king-two-squares form (`e1g1`).
-
-use std::path::Path;
-
-use shakmaty::{EnPassantMode, Position, zobrist::Zobrist64};
-
-use crate::board::{Board, Piece};
+use crate::board::{Board, Color, Piece};
+use crate::fbk;
 use crate::moves::Move;
-use crate::syzygy::board_to_chess;
 
-#[derive(Copy, Clone)]
-struct Entry {
-    key:    u64,
-    mv:     u16,
-    weight: u16,
-}
-
-pub struct Book {
-    entries: Vec<Entry>,
-}
-
-impl Book {
-    /// Load a Polyglot book into memory.
-    pub fn load(path: impl AsRef<Path>) -> Result<Book, String> {
-        let bytes = std::fs::read(path.as_ref()).map_err(|e| e.to_string())?;
-        if bytes.is_empty() || bytes.len() % 16 != 0 {
-            return Err(format!("size {} is not a multiple of 16 bytes", bytes.len()));
+pub fn fbk_position(board: &Board) -> fbk::Position {
+    let mut squares = [None; 64];
+    for (sq, cell) in board.sq_piece.iter().enumerate() {
+        squares[sq] = cell.map(|(piece, color)| {
+            let color = match color {
+                Color::White => fbk::Color::White,
+                Color::Black => fbk::Color::Black,
+            };
+            let piece = match piece {
+                Piece::Pawn => fbk::Piece::Pawn,
+                Piece::Knight => fbk::Piece::Knight,
+                Piece::Bishop => fbk::Piece::Bishop,
+                Piece::Rook => fbk::Piece::Rook,
+                Piece::Queen => fbk::Piece::Queen,
+                Piece::King => fbk::Piece::King,
+            };
+            (color, piece)
+        });
+    }
+    let mut castling_rooks = 0u64;
+    for (idx, info) in board.castle.iter().enumerate() {
+        if board.castling & (1 << idx) != 0 {
+            castling_rooks |= 1u64 << info.rook;
         }
-        let entries: Vec<Entry> = bytes
-            .chunks_exact(16)
-            .map(|c| Entry {
-                key:    u64::from_be_bytes(c[0..8].try_into().unwrap()),
-                mv:     u16::from_be_bytes(c[8..10].try_into().unwrap()),
-                weight: u16::from_be_bytes(c[10..12].try_into().unwrap()),
-            })
-            .collect();
-        if !entries.windows(2).all(|w| w[0].key <= w[1].key) {
-            return Err("entries are not sorted by key".to_string());
-        }
-        Ok(Book { entries })
     }
+    fbk::Position {
+        board: squares,
+        black_to_move: board.side == Color::Black,
+        castling_rooks,
 
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// All legal book moves for `board` with their weights, in book order.
-    /// Entries whose move isn't legal here (corrupt book or hash collision)
-    /// are dropped.
-    pub fn moves(&self, board: &Board) -> Vec<(Move, u16)> {
-        let Some(key) = polyglot_key(board) else { return Vec::new() };
-        let start = self.entries.partition_point(|e| e.key < key);
-        self.entries[start..]
-            .iter()
-            .take_while(|e| e.key == key)
-            .filter_map(|e| decode_move(board, e.mv).map(|m| (m, e.weight)))
-            .collect()
-    }
-
-    /// Pick a book move at random, weighted by the book's weights. `rand` is
-    /// any uniformly distributed u64. Returns `None` when out of book.
-    pub fn pick(&self, board: &Board, rand: u64) -> Option<Move> {
-        let moves = self.moves(board);
-        let total: u64 = moves.iter().map(|&(_, w)| w as u64).sum();
-        if total == 0 {
-
-            return (!moves.is_empty()).then(|| moves[(rand % moves.len() as u64) as usize].0);
-        }
-        let mut r = rand % total;
-        for &(mv, w) in &moves {
-            if r < w as u64 {
-                return Some(mv);
-            }
-            r -= w as u64;
-        }
-        None
+        ep_square: board.ep_sq,
     }
 }
 
-/// Polyglot Zobrist key of `board`. The en passant square is hashed only when
-/// a side-to-move pawn could capture onto it, as the Polyglot spec says.
-pub fn polyglot_key(board: &Board) -> Option<u64> {
-    let pos = board_to_chess(board)?;
-    Some(pos.zobrist_hash::<Zobrist64>(EnPassantMode::PseudoLegal).0)
+pub fn fbk_pick(book: &fbk::Book, board: &Board, rand: u64) -> Option<Move> {
+    let key = fbk_position(board).key();
+    let mv = book.choose(key, &fbk::Policy::default(), rand)?;
+    board.find_uci_move(&mv.to_string())
 }
 
-/// Translate a Polyglot move to the matching legal engine move.
-fn decode_move(board: &Board, raw: u16) -> Option<Move> {
-    let to    = (raw & 0x3F) as u8;
-    let from  = ((raw >> 6) & 0x3F) as u8;
-    let promo = (raw >> 12) & 0x7;
-
-    let mut to = to;
-    if let (Some((Piece::King, kc)), Some((Piece::Rook, rc))) =
-        (board.sq_piece[from as usize], board.sq_piece[to as usize])
-        && kc == rc
-    {
-        to = if to > from { from + 2 } else { from - 2 };
-    }
-
-    let mut uci = format!("{}{}", sq_name(from), sq_name(to));
-    match promo {
-        0 => {}
-        1 => uci.push('n'),
-        2 => uci.push('b'),
-        3 => uci.push('r'),
-        4 => uci.push('q'),
-        _ => return None,
-    }
-    board.find_uci_move(&uci)
+pub fn fbk_moves(book: &fbk::Book, board: &Board) -> Vec<(Move, u32)> {
+    book.probe(fbk_position(board).key())
+        .into_iter()
+        .filter_map(|e| {
+            board
+                .find_uci_move(&e.mv.to_string())
+                .map(|m| (m, e.games()))
+        })
+        .collect()
 }
 
-fn sq_name(sq: u8) -> String {
-    format!("{}{}", (b'a' + (sq & 7)) as char, (b'1' + (sq >> 3)) as char)
-}
-
-/// Small xorshift64* generator for picking book moves; no `rand` dependency.
 pub struct Rng(u64);
 
 impl Rng {
@@ -132,7 +60,6 @@ impl Rng {
         Rng(seed | 1)
     }
 
-    /// Seeded from the clock -- fine for varying book choices between games.
     pub fn from_time() -> Rng {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -153,56 +80,98 @@ impl Rng {
 mod tests {
     use super::*;
 
-    /// Polyglot reference keys from the spec (the same set shakmaty checks).
     #[test]
-    fn polyglot_reference_keys() {
-        let cases = [
-            ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", 0x463b_9618_1691_fc9c),
-            ("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1", 0x823c_9b50_fd11_4196),
-            ("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR b KQkq - 0 2", 0x662f_afb9_65db_29d4),
-            ("rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3", 0x22a4_8b5a_8e47_ff78),
-            ("rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPPKPPP/RNBQ1BNR b kq - 1 3", 0x652a_607c_a3f2_42c1),
-            ("rnbqkbnr/p1pppppp/8/8/PpP4P/8/1P1PPPP1/RNBQKBNR b KQkq c3 0 3", 0x3c81_23ea_7b06_7637),
-        ];
-        for (fen, want) in cases {
-            let b = Board::from_fen(fen).unwrap();
-            assert_eq!(polyglot_key(&b), Some(want), "{fen}");
+    fn fbk_keys_match_reference() {
+        let mut b = Board::from_fen("1r4kr/pppppppp/8/8/8/8/PPPPPPPP/1R4KR w HBhb - 0 1").unwrap();
+        assert_eq!(fbk_position(&b).key(), 0xa1aa_db7b_111f_7fab);
+        b.apply_moves(&["e2e4", "d7d5", "e4e5", "f7f5"]);
+        assert_eq!(fbk_position(&b).key(), 0x847b_ea0a_e4d4_29e6, "ep f6");
+        b.apply_moves(&["e5f6", "g8h8"]);
+        assert_eq!(fbk_position(&b).key(), 0x6d6d_25f0_1cff_6489, "black O-O");
+        b.apply_moves(&["g1b1"]);
+        assert_eq!(fbk_position(&b).key(), 0xd428_c5dc_72ec_f425, "white O-O-O");
+
+        assert_eq!(
+            fbk_position(&b).key(),
+            fbk::key_from_fen(&b.to_fen()).unwrap()
+        );
+        assert_eq!(
+            fbk_position(&Board::start_pos()).key(),
+            0xa49d_4ce9_1cd6_b7ce,
+            "standard start"
+        );
+    }
+
+    fn fbk_book(entries: &[(u64, u16, u32)]) -> fbk::Book {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FBKBOOK\0");
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&32u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&64u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.resize(64, 0);
+        for &(key, mv, games) in entries {
+            bytes.extend_from_slice(&key.to_le_bytes());
+            bytes.extend_from_slice(&mv.to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&games.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&i16::MIN.to_le_bytes());
+            bytes.extend_from_slice(&[0u8; 6]);
         }
+        fbk::Book::from_bytes(bytes).unwrap()
     }
 
     #[test]
-    fn castling_decodes_to_king_two_squares() {
-        let b = Board::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").unwrap();
+    fn fbk_pick_resolves_chess960_castling() {
+        let b = Board::from_fen("1r4kr/pppppppp/8/8/8/8/PPPPPPPP/1R4KR w HBhb - 0 1").unwrap();
+        let key = fbk_position(&b).key();
 
-        assert_eq!(decode_move(&b, (4 << 6) | 7).unwrap().to_uci(), "e1g1");
-        assert_eq!(decode_move(&b, 4 << 6).unwrap().to_uci(), "e1c1");
-    }
-
-    #[test]
-    fn promotion_decodes() {
-        let b = Board::from_fen("8/P6k/8/8/8/8/8/K7 w - - 0 1").unwrap();
-
-        assert_eq!(decode_move(&b, (1 << 12) | (48 << 6) | 56).unwrap().to_uci(), "a7a8n");
-        assert_eq!(decode_move(&b, (4 << 12) | (48 << 6) | 56).unwrap().to_uci(), "a7a8q");
-    }
-
-    /// The datagen book (tracked in the repo). Walks random weighted lines
-    /// from startpos until each leaves the book; every move must be legal,
-    /// and the book must cover startpos.
-    #[test]
-    fn tcec26_random_lines() {
-        let book = Book::load("books/TCEC26.bin").expect("books/TCEC26.bin");
-        assert!(!book.moves(&Board::start_pos()).is_empty(), "startpos not in book");
-        let mut rng = Rng::new(12345);
-        for _ in 0..200 {
-            let mut b = Board::start_pos();
-            let mut ply = 0;
-            while let Some(mv) = book.pick(&b, rng.next()) {
-                b.make_move(mv);
-                ply += 1;
-                assert!(ply < 200, "book line never ends");
+        let book = fbk_book(&[(key, (6 << 6) | 7, 3), (key, (6 << 6) | 1, 1)]);
+        let mut seen = [false; 2];
+        for r in 0..4 {
+            let mv = fbk_pick(&book, &b, r).expect("book move");
+            match b.castle_rook(mv) {
+                Some(7) => seen[0] = true,
+                Some(1) => seen[1] = true,
+                other => panic!("not castling: {other:?}"),
             }
-            assert!(ply > 0);
         }
+        assert_eq!(seen, [true, true]);
+
+        assert_eq!(fbk_pick(&book, &Board::start_pos(), 0), None);
+    }
+
+    #[test]
+    fn fbk_pick_resolves_standard_castling() {
+        let b = Board::from_fen("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1").unwrap();
+        let book = fbk_book(&[(fbk_position(&b).key(), (4 << 6) | 7, 1)]);
+        let mv = fbk_pick(&book, &b, 0).unwrap();
+        assert_eq!(mv.to_uci(), "e1g1");
+        assert_eq!(b.castle_rook(mv), Some(7));
+    }
+
+    #[test]
+    fn fbk_moves_lists_legal_moves_in_order() {
+        let b = Board::start_pos();
+        let key = fbk_position(&b).key();
+
+        let e4 = (12 << 6) | 28;
+        let d4 = (11 << 6) | 27;
+        let bad = (12 << 6) | 36;
+        let book = fbk_book(&[(key, e4, 5), (key, d4, 2), (key, bad, 1)]);
+        let moves: Vec<(String, u32)> = fbk_moves(&book, &b)
+            .into_iter()
+            .map(|(m, g)| (m.to_uci(), g))
+            .collect();
+        assert_eq!(
+            moves,
+            vec![("e2e4".to_string(), 5), ("d2d4".to_string(), 2)]
+        );
     }
 }

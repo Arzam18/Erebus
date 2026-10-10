@@ -1,20 +1,3 @@
-//! Self-play training data generation, written as Stockfish binpacks.
-//!
-//! Every game is played from the start position, so each binpack chain is a
-//! whole game: the opening (book moves, then a few random plies) and the
-//! searched remainder. Every position is searched, including the opening
-//! plies, so each entry carries a real score; the stored move is the one
-//! actually played, which is what binpack chain compression requires.
-//!
-//! Single-threaded fixed-budget search is deterministic -- the same position
-//! always yields the same move -- so diversity is injected on purpose:
-//!   1. book moves picked at random (weighted, or uniform with `--book-uniform`),
-//!   2. `--random-plies` uniformly random legal moves after leaving the book,
-//!   3. a jittered node budget per move (`nodes` .. `nodes * 1.5`),
-//!   4. a run-wide set of opening end positions: a repeat is rejected.
-//!
-//! Each worker thread writes its own `<stem>.t<N>.binpack`.
-
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufWriter;
@@ -25,16 +8,17 @@ use std::time::{Duration, Instant};
 use sfbinpack::chess::{
     color::Color as SfColor,
     coords::Square as SfSquare,
+    r#move::{Move as SfMove, MoveType as SfMoveType},
     piece::Piece as SfPiece,
     piecetype::PieceType as SfPieceType,
     position::Position as SfPosition,
-    r#move::{Move as SfMove, MoveType as SfMoveType},
 };
 use sfbinpack::{CompressedTrainingDataEntryWriter, TrainingDataEntry};
 
-use crate::board::{Board, Color, Piece};
-use crate::book::{Book, Rng};
+use crate::board::{Board, Color, Piece, castle_index};
+use crate::book::{Rng, fbk_moves, fbk_pick};
 use crate::eval::MATE_SCORE;
+use crate::fbk;
 use crate::movegen::MoveGen;
 use crate::moves::{Move, MoveFlag, MoveList};
 use crate::search::{SearchLimits, SearchTables, Searcher};
@@ -42,78 +26,72 @@ use crate::syzygy::{SyzygyTb, WdlResult};
 use crate::tt::TranspositionTable;
 
 pub struct Config {
-    /// Output path; worker `N` writes `<stem>.t<N>.binpack`.
-    pub out:          String,
-    pub games:        u64,
-    pub threads:      usize,
-    /// Base soft node budget per move.
-    pub nodes:        u64,
-    pub book:         Option<String>,
+    pub out: String,
+    pub games: u64,
+    pub threads: usize,
+
+    pub nodes: u64,
+    pub book: Option<String>,
     pub book_uniform: bool,
     pub random_plies: u32,
-    pub syzygy:       Option<String>,
-    pub seed:         u64,
-    /// Transposition table per worker, MB.
-    pub hash_mb:      usize,
+    pub syzygy: Option<String>,
+    pub seed: u64,
+
+    pub hash_mb: usize,
 }
 
-/// |score| at or above this for `WIN_PLIES` plies in a row: decisive.
 const WIN_SCORE: i32 = 2500;
 const WIN_PLIES: u32 = 4;
-/// |score| at or below this for `DRAW_PLIES` plies in a row, from
-/// `DRAW_MIN_PLY` on: drawn.
+
 const DRAW_SCORE: i32 = 10;
 const DRAW_PLIES: u32 = 8;
 const DRAW_MIN_PLY: usize = 80;
-/// Hard game length cap (counted as a draw).
+
 const MAX_GAME_PLY: usize = 600;
-/// An opening whose search score is further than this from equal is thrown
-/// away -- a lopsided start teaches little.
+
 const MAX_OPENING_SCORE: i32 = 1000;
-/// Stored scores are clamped to this. Mate / TB-win scores land above the
-/// trainer's |score| <= 10000 filter, so those entries are skipped there.
+
 const SCORE_CLAMP: i32 = 32_000;
-/// Give up after this many rejected openings in a row (book exhausted).
+
 const MAX_REJECTS: u32 = 10_000;
 
 #[derive(Default)]
 struct Stats {
-    games:          AtomicU64,
-    positions:      AtomicU64,
-    /// Every search, including opening balance checks of rejected games.
-    searches:       AtomicU64,
-    nodes:          AtomicU64,
-    white_wins:     AtomicU64,
-    draws:          AtomicU64,
-    black_wins:     AtomicU64,
-    dup_rejects:    AtomicU64,
-    unbal_rejects:  AtomicU64,
-    /// Post-opening positions sampled for the uniqueness estimate
-    /// (1 in `SAMPLE_MOD` by hash), and how many of them were new.
-    sampled:        AtomicU64,
+    games: AtomicU64,
+    positions: AtomicU64,
+
+    searches: AtomicU64,
+    nodes: AtomicU64,
+    white_wins: AtomicU64,
+    draws: AtomicU64,
+    black_wins: AtomicU64,
+    dup_rejects: AtomicU64,
+    unbal_rejects: AtomicU64,
+
+    sampled: AtomicU64,
     sampled_unique: AtomicU64,
 }
 
 const SAMPLE_MOD: u64 = 64;
 
 struct Shared {
-    cfg:         Config,
-    book:        Option<Book>,
-    tb:          Arc<Option<SyzygyTb>>,
-    /// Game slots handed out so far (`< cfg.games` means more to play).
-    claimed:     AtomicU64,
-    /// Zobrist keys of opening end positions already used.
-    openings:    Mutex<HashSet<u64>>,
-    /// Sampled post-opening position keys (uniqueness measurement).
-    seen:        Mutex<HashSet<u64>>,
-    stats:       Stats,
+    cfg: Config,
+    book: Option<fbk::Book>,
+    tb: Arc<Option<SyzygyTb>>,
+
+    claimed: AtomicU64,
+
+    openings: Mutex<HashSet<u64>>,
+
+    seen: Mutex<HashSet<u64>>,
+    stats: Stats,
 }
 
 pub fn run(cfg: Config) {
     let book = match cfg.book.as_deref() {
-        Some(path) => match Book::load(path) {
+        Some(path) => match fbk::Book::open(path) {
             Ok(b) => {
-                eprintln!("datagen: book {path} ({} entries)", b.len());
+                eprintln!("datagen: book {path} ({} moves)", b.len());
                 Some(b)
             }
             Err(e) => {
@@ -131,15 +109,26 @@ pub fn run(cfg: Config) {
     let tb = match cfg.syzygy.as_deref() {
         Some(path) => {
             let mut tb = SyzygyTb::new();
-            let n: usize = path.split(';').map(|p| p.trim()).filter(|p| !p.is_empty())
-                .map(|p| tb.add_directory(p)).sum();
-            eprintln!("datagen: {n} Syzygy file(s), up to {} pieces", tb.max_pieces());
+            let n: usize = path
+                .split(';')
+                .map(|p| p.trim())
+                .filter(|p| !p.is_empty())
+                .map(|p| tb.add_directory(p))
+                .sum();
+            eprintln!(
+                "datagen: {n} Syzygy file(s), up to {} pieces",
+                tb.max_pieces()
+            );
             if n > 0 { Some(tb) } else { None }
         }
         None => None,
     };
 
-    let stem = cfg.out.strip_suffix(".binpack").unwrap_or(&cfg.out).to_string();
+    let stem = cfg
+        .out
+        .strip_suffix(".binpack")
+        .unwrap_or(&cfg.out)
+        .to_string();
     let mut writers = Vec::new();
     for t in 0..cfg.threads {
         let path = format!("{stem}.t{t}.binpack");
@@ -156,8 +145,18 @@ pub fn run(cfg: Config) {
 
     eprintln!(
         "datagen: {} games, {} threads, {}-{} nodes/move, random plies {}, book {}, seed {}",
-        cfg.games, cfg.threads, cfg.nodes, cfg.nodes + cfg.nodes / 2, cfg.random_plies,
-        if book.is_none() { "none" } else if cfg.book_uniform { "uniform" } else { "weighted" },
+        cfg.games,
+        cfg.threads,
+        cfg.nodes,
+        cfg.nodes + cfg.nodes / 2,
+        cfg.random_plies,
+        if book.is_none() {
+            "none"
+        } else if cfg.book_uniform {
+            "uniform"
+        } else {
+            "weighted"
+        },
         cfg.seed,
     );
 
@@ -214,37 +213,36 @@ fn report(st: &Stats, elapsed: Duration) {
         st.black_wins.load(Ordering::Relaxed),
         st.dup_rejects.load(Ordering::Relaxed),
         st.unbal_rejects.load(Ordering::Relaxed),
-        if sampled == 0 { 100.0 } else { 100.0 * unique as f64 / sampled as f64 },
+        if sampled == 0 {
+            100.0
+        } else {
+            100.0 * unique as f64 / sampled as f64
+        },
         secs,
     );
 }
 
-/// One played game: the moves from the start position, the search score
-/// (side-to-move relative) of the position each was played from, and the
-/// result from White's point of view.
 struct Game {
-    moves:        Vec<Move>,
-    scores:       Vec<i32>,
+    moves: Vec<Move>,
+    scores: Vec<i32>,
     white_result: i16,
 }
 
 struct Engine {
-    tt:     Arc<TranspositionTable>,
-    tb:     Arc<Option<SyzygyTb>>,
+    tt: Arc<TranspositionTable>,
+    tb: Arc<Option<SyzygyTb>>,
     tables: Option<SearchTables>,
-    /// Nodes and searches since the last `take_counts`.
-    nodes:    Arc<AtomicU64>,
+
+    nodes: Arc<AtomicU64>,
     searches: u64,
 }
 
 impl Engine {
-    /// Search `board` with a soft node budget (hard cap 4x); returns the best
-    /// move and its score.
     fn search(&mut self, board: &mut Board, soft_nodes: u64) -> (Move, i32) {
         let limits = SearchLimits {
             soft_nodes: Some(soft_nodes),
-            nodes:      Some(soft_nodes * 4),
-            quiet:      true,
+            nodes: Some(soft_nodes * 4),
+            quiet: true,
             ..SearchLimits::default()
         };
         let mut searcher = Searcher::new(
@@ -265,13 +263,13 @@ impl Engine {
         (mv, score)
     }
 
-    /// Fold this engine's node / search counts into the run totals.
     fn take_counts(&mut self, st: &Stats) {
-        st.nodes.fetch_add(self.nodes.swap(0, Ordering::Relaxed), Ordering::Relaxed);
-        st.searches.fetch_add(std::mem::take(&mut self.searches), Ordering::Relaxed);
+        st.nodes
+            .fetch_add(self.nodes.swap(0, Ordering::Relaxed), Ordering::Relaxed);
+        st.searches
+            .fetch_add(std::mem::take(&mut self.searches), Ordering::Relaxed);
     }
 
-    /// Fresh state per game, so a game depends only on its own moves.
     fn new_game(&mut self) {
         self.tt.clear();
         self.tables = Some(SearchTables::default());
@@ -282,10 +280,10 @@ fn worker(shared: &Shared, tid: usize, file: File) {
     let cfg = &shared.cfg;
     let mut rng = Rng::new(cfg.seed ^ (tid as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let mut engine = Engine {
-        tt:     Arc::new(TranspositionTable::new(cfg.hash_mb)),
-        tb:     Arc::clone(&shared.tb),
+        tt: Arc::new(TranspositionTable::new(cfg.hash_mb)),
+        tb: Arc::clone(&shared.tb),
         tables: None,
-        nodes:    Arc::new(AtomicU64::new(0)),
+        nodes: Arc::new(AtomicU64::new(0)),
         searches: 0,
     };
     let mut writer = match CompressedTrainingDataEntryWriter::new(BufWriter::new(file)) {
@@ -306,7 +304,9 @@ fn worker(shared: &Shared, tid: usize, file: File) {
             }
             rejects += 1;
             if rejects >= MAX_REJECTS {
-                eprintln!("datagen: thread {tid}: {MAX_REJECTS} openings rejected in a row, stopping");
+                eprintln!(
+                    "datagen: thread {tid}: {MAX_REJECTS} openings rejected in a row, stopping"
+                );
                 return;
             }
         };
@@ -316,28 +316,30 @@ fn worker(shared: &Shared, tid: usize, file: File) {
         }
         let st = &shared.stats;
         st.games.fetch_add(1, Ordering::Relaxed);
-        st.positions.fetch_add(game.moves.len() as u64, Ordering::Relaxed);
+        st.positions
+            .fetch_add(game.moves.len() as u64, Ordering::Relaxed);
         match game.white_result {
             1 => st.white_wins.fetch_add(1, Ordering::Relaxed),
             -1 => st.black_wins.fetch_add(1, Ordering::Relaxed),
             _ => st.draws.fetch_add(1, Ordering::Relaxed),
         };
     }
-
 }
 
-/// Build the opening move list: book moves, then random plies. `None` if the
-/// game would end inside the opening.
 fn pick_opening(shared: &Shared, rng: &mut Rng) -> Option<(Vec<Move>, Board)> {
     let mut board = Board::start_pos();
     let mut moves = Vec::new();
     if let Some(book) = &shared.book {
         loop {
             let mv = if shared.cfg.book_uniform {
-                let list = book.moves(&board);
-                if list.is_empty() { None } else { Some(list[(rng.next() % list.len() as u64) as usize].0) }
+                let list = fbk_moves(book, &board);
+                if list.is_empty() {
+                    None
+                } else {
+                    Some(list[(rng.next() % list.len() as u64) as usize].0)
+                }
             } else {
-                book.pick(&board, rng.next())
+                fbk_pick(book, &board, rng.next())
             };
             let Some(mv) = mv else { break };
             board.make_move(mv);
@@ -397,9 +399,17 @@ fn play_game(shared: &Shared, engine: &mut Engine, rng: &mut Rng) -> Option<Game
         if best.is_null() {
             break 0;
         }
-        let mv = if ply < opening.len() { opening[ply] } else { best };
+        let mv = if ply < opening.len() {
+            opening[ply]
+        } else {
+            best
+        };
 
-        let white_score = if board.side == Color::White { score } else { -score };
+        let white_score = if board.side == Color::White {
+            score
+        } else {
+            -score
+        };
         if white_score.abs() >= WIN_SCORE {
             let sign = white_score.signum();
             win_run = if sign == win_sign { win_run + 1 } else { 1 };
@@ -407,7 +417,11 @@ fn play_game(shared: &Shared, engine: &mut Engine, rng: &mut Rng) -> Option<Game
         } else {
             win_run = 0;
         }
-        draw_run = if ply >= DRAW_MIN_PLY && score.abs() <= DRAW_SCORE { draw_run + 1 } else { 0 };
+        draw_run = if ply >= DRAW_MIN_PLY && score.abs() <= DRAW_SCORE {
+            draw_run + 1
+        } else {
+            0
+        };
 
         if ply >= opening.len() {
             sample_position(shared, board.hash);
@@ -424,12 +438,13 @@ fn play_game(shared: &Shared, engine: &mut Engine, rng: &mut Rng) -> Option<Game
         }
     };
 
-    Some(Game { moves, scores, white_result })
+    Some(Game {
+        moves,
+        scores,
+        white_result,
+    })
 }
 
-/// Result from White's point of view if the game is over here: no legal
-/// moves, 50-move rule, threefold repetition, insufficient material, or a
-/// tablebase verdict.
 fn game_over(board: &Board, shared: &Shared) -> Option<i16> {
     let mut list = MoveList::new();
     MoveGen::generate_all(board, &mut list);
@@ -456,8 +471,6 @@ fn game_over(board: &Board, shared: &Shared) -> Option<i16> {
     None
 }
 
-/// The current position has occurred twice before (same side to move,
-/// within the reversible stretch).
 fn is_threefold(board: &Board) -> bool {
     let n = board.history.len();
     let lookback = (board.halfmove as usize).min(n);
@@ -485,9 +498,6 @@ fn sample_position(shared: &Shared, key: u64) {
 
 const STARTPOS: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
 
-/// Write one game as a single binpack chain. Positions are derived with
-/// sfbinpack's own `after_move`, so consecutive entries are always
-/// recognised as continuations.
 fn write_game<W: std::io::Write>(
     writer: &mut CompressedTrainingDataEntryWriter<W>,
     game: &Game,
@@ -502,7 +512,11 @@ fn write_game<W: std::io::Write>(
             mv: sf_mv,
             score: score.clamp(-SCORE_CLAMP, SCORE_CLAMP) as i16,
             ply: ply as u16,
-            result: if stm_white { game.white_result } else { -game.white_result },
+            result: if stm_white {
+                game.white_result
+            } else {
+                -game.white_result
+            },
         };
         writer.write_entry(&entry).map_err(|e| e.to_string())?;
         pos = pos.after_move(sf_mv);
@@ -511,17 +525,23 @@ fn write_game<W: std::io::Write>(
     Ok(())
 }
 
-/// Engine move -> sfbinpack move. Castling is king-takes-rook there; en
-/// passant and promotions carry their own move type.
 fn to_sf_move(board: &Board, mv: Move) -> SfMove {
     let from = SfSquare::new(mv.from() as u32);
     let to = SfSquare::new(mv.to() as u32);
-    let color = if board.side == Color::White { SfColor::White } else { SfColor::Black };
+    let color = if board.side == Color::White {
+        SfColor::White
+    } else {
+        SfColor::Black
+    };
     match mv.flags() {
         MoveFlag::CastleKing | MoveFlag::CastleQueen => {
-            let rank_base = mv.from() & !7;
-            let rook = if mv.flags() == MoveFlag::CastleKing { rank_base + 7 } else { rank_base };
-            SfMove::new(from, SfSquare::new(rook as u32), SfMoveType::Castle, SfPiece::none())
+            let rook = board.castle[castle_index(board.side, mv.flags())].rook;
+            SfMove::new(
+                from,
+                SfSquare::new(rook as u32),
+                SfMoveType::Castle,
+                SfPiece::none(),
+            )
         }
         MoveFlag::EnPassant => SfMove::new(from, to, SfMoveType::EnPassant, SfPiece::none()),
         _ => match mv.promo_piece() {
@@ -544,10 +564,6 @@ mod tests {
     use super::*;
     use sfbinpack::CompressedTrainingDataEntryReader;
 
-    /// Same position: board, side and castling must match exactly. The
-    /// engine sets the en passant square after every double push, sfbinpack
-    /// only when a capture is possible, so ep must match only when sfbinpack
-    /// has one.
     fn assert_same(sf: &str, engine: &str, what: &str) {
         let a: Vec<&str> = sf.split_whitespace().collect();
         let b: Vec<&str> = engine.split_whitespace().collect();
@@ -557,8 +573,6 @@ mod tests {
         }
     }
 
-    /// Play a short real game set, write it, read it back with the trainer's
-    /// reader, and check every position, move and result against the engine.
     #[test]
     fn binpack_round_trip() {
         crate::nnue::load_embedded();
@@ -569,8 +583,16 @@ mod tests {
 
         let shared = Shared {
             cfg: Config {
-                out: String::new(), games: 0, threads: 1, nodes: 300, book: None,
-                book_uniform: false, random_plies: 8, syzygy: None, seed: 7, hash_mb: 2,
+                out: String::new(),
+                games: 0,
+                threads: 1,
+                nodes: 300,
+                book: None,
+                book_uniform: false,
+                random_plies: 8,
+                syzygy: None,
+                seed: 7,
+                hash_mb: 2,
             },
             book: None,
             tb: Arc::new(None),
@@ -580,8 +602,11 @@ mod tests {
             stats: Stats::default(),
         };
         let mut engine = Engine {
-            tt: Arc::new(TranspositionTable::new(2)), tb: Arc::new(None), tables: None,
-            nodes: Arc::new(AtomicU64::new(0)), searches: 0,
+            tt: Arc::new(TranspositionTable::new(2)),
+            tb: Arc::new(None),
+            tables: None,
+            nodes: Arc::new(AtomicU64::new(0)),
+            searches: 0,
         };
         let mut rng = Rng::new(99);
         let mut games = Vec::new();
@@ -591,25 +616,42 @@ mod tests {
             }
         }
         {
-            let mut w = CompressedTrainingDataEntryWriter::new(File::create(&path).unwrap()).unwrap();
+            let mut w =
+                CompressedTrainingDataEntryWriter::new(File::create(&path).unwrap()).unwrap();
             for g in &games {
                 write_game(&mut w, g).unwrap();
             }
         }
 
-        let mut reader = CompressedTrainingDataEntryReader::new(File::open(&path).unwrap()).unwrap();
+        let mut reader =
+            CompressedTrainingDataEntryReader::new(File::open(&path).unwrap()).unwrap();
         for g in &games {
             let mut board = Board::start_pos();
             for (ply, &mv) in g.moves.iter().enumerate() {
                 assert!(reader.has_next());
                 let e = reader.next();
-                assert_same(&e.pos.fen().unwrap(), &board.to_fen(), &format!("ply {ply}"));
+                assert_same(
+                    &e.pos.fen().unwrap(),
+                    &board.to_fen(),
+                    &format!("ply {ply}"),
+                );
                 let uci = e.mv.as_uci();
-                assert_eq!(board.find_uci_move(&uci).map(|m| m.to_uci()), Some(mv.to_uci()), "{uci}");
+                assert_eq!(
+                    board.find_uci_move(&uci).map(|m| m.to_uci()),
+                    Some(mv.to_uci()),
+                    "{uci}"
+                );
                 assert_eq!(e.ply as usize, ply);
-                let stm_res = if board.side == Color::White { g.white_result } else { -g.white_result };
+                let stm_res = if board.side == Color::White {
+                    g.white_result
+                } else {
+                    -g.white_result
+                };
                 assert_eq!(e.result, stm_res);
-                assert_eq!(e.score as i32, g.scores[ply].clamp(-SCORE_CLAMP, SCORE_CLAMP));
+                assert_eq!(
+                    e.score as i32,
+                    g.scores[ply].clamp(-SCORE_CLAMP, SCORE_CLAMP)
+                );
                 board.make_move(mv);
             }
         }
