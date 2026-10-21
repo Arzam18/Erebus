@@ -1,6 +1,6 @@
 [package]
 name = "erebus"
-version = "2.1.1"
+version = "2.2.7"
 edition = "2024"
 rust-version = "1.88"
 description = "UCI chess engine with NNUE evaluation"

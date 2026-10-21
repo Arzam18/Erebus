@@ -1,3 +1,5 @@
+
+
 use std::fmt;
 use std::io;
 use std::path::Path;
@@ -58,11 +60,7 @@ pub enum Piece {
 
 impl Piece {
     fn from_char(c: char) -> Option<(Color, Piece)> {
-        let color = if c.is_ascii_uppercase() {
-            Color::White
-        } else {
-            Color::Black
-        };
+        let color = if c.is_ascii_uppercase() { Color::White } else { Color::Black };
         let piece = match c.to_ascii_lowercase() {
             'p' => Piece::Pawn,
             'n' => Piece::Knight,
@@ -87,6 +85,7 @@ pub struct Position {
 }
 
 impl Position {
+
     pub fn from_fen(fen: &str) -> Result<Position, String> {
         let parts: Vec<&str> = fen.split_whitespace().collect();
         if parts.len() < 4 {
@@ -126,14 +125,9 @@ impl Position {
         let mut castling_rooks = 0u64;
         if parts[2] != "-" {
             for c in parts[2].chars() {
-                let color = if c.is_ascii_uppercase() {
-                    Color::White
-                } else {
-                    Color::Black
-                };
+                let color = if c.is_ascii_uppercase() { Color::White } else { Color::Black };
                 let base = if color == Color::White { 0 } else { 56 };
-                let Some(king_file) =
-                    (0..8).find(|&f| board[base + f] == Some((color, Piece::King)))
+                let Some(king_file) = (0..8).find(|&f| board[base + f] == Some((color, Piece::King)))
                 else {
                     continue;
                 };
@@ -155,12 +149,7 @@ impl Position {
             s => Some(parse_square(s).ok_or(format!("bad en passant square {s:?}"))?),
         };
 
-        Ok(Position {
-            board,
-            black_to_move,
-            castling_rooks,
-            ep_square,
-        })
+        Ok(Position { board, black_to_move, castling_rooks, ep_square })
     }
 
     pub fn key(&self) -> u64 {
@@ -221,11 +210,7 @@ fn parse_square(s: &str) -> Option<u8> {
 }
 
 fn square_name(sq: u8) -> String {
-    format!(
-        "{}{}",
-        (b'a' + (sq & 7)) as char,
-        (b'1' + (sq >> 3)) as char
-    )
+    format!("{}{}", (b'a' + (sq & 7)) as char, (b'1' + (sq >> 3)) as char)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -251,10 +236,7 @@ impl BookMove {
     }
 
     pub fn is_castling(self, pos: &Position) -> bool {
-        match (
-            pos.board[self.from() as usize],
-            pos.board[self.to() as usize],
-        ) {
+        match (pos.board[self.from() as usize], pos.board[self.to() as usize]) {
             (Some((c1, Piece::King)), Some((c2, Piece::Rook))) => c1 == c2,
             _ => false,
         }
@@ -278,6 +260,7 @@ impl BookMove {
 }
 
 impl fmt::Display for BookMove {
+
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let promo = match self.promotion() {
             Some(Piece::Knight) => "n",
@@ -286,13 +269,7 @@ impl fmt::Display for BookMove {
             Some(Piece::Queen) => "q",
             _ => "",
         };
-        write!(
-            f,
-            "{}{}{}",
-            square_name(self.from()),
-            square_name(self.to()),
-            promo
-        )
+        write!(f, "{}{}{}", square_name(self.from()), square_name(self.to()), promo)
     }
 }
 
@@ -334,6 +311,7 @@ impl Entry {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Policy {
+
     pub min_games: u32,
 
     pub max_eval_drop: Option<i32>,
@@ -341,10 +319,7 @@ pub struct Policy {
 
 impl Default for Policy {
     fn default() -> Self {
-        Policy {
-            min_games: 1,
-            max_eval_drop: Some(50),
-        }
+        Policy { min_games: 1, max_eval_drop: Some(50) }
     }
 }
 
@@ -402,15 +377,7 @@ impl Book {
         if end > data.len() || HEADER_SIZE + meta_len > data.len() {
             return Err(invalid("truncated FBK book"));
         }
-        Ok(Book {
-            data,
-            flags,
-            game_count,
-            entry_size,
-            count,
-            offset,
-            meta_len,
-        })
+        Ok(Book { data, flags, game_count, entry_size, count, offset, meta_len })
     }
 
     pub fn len(&self) -> usize {
@@ -461,11 +428,8 @@ impl Book {
     }
 
     pub fn choose(&self, key: u64, policy: &Policy, random: u64) -> Option<BookMove> {
-        let mut cands: Vec<Entry> = self
-            .probe(key)
-            .into_iter()
-            .filter(|e| e.games() >= policy.min_games)
-            .collect();
+        let mut cands: Vec<Entry> =
+            self.probe(key).into_iter().filter(|e| e.games() >= policy.min_games).collect();
         if let Some(drop) = policy.max_eval_drop {
             if let Some(best) = cands.iter().filter_map(|e| e.eval()).max() {
                 let floor = best as i32 - drop;
@@ -508,6 +472,7 @@ mod tests {
 
     #[test]
     fn ep_only_counts_when_capturable() {
+
         let with = key_from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1");
         let without = key_from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
         assert_eq!(with, without);
@@ -519,8 +484,7 @@ mod tests {
 
     #[test]
     fn castling_uci_conversion() {
-        let pos =
-            Position::from_fen("rnbqk2r/pppppppp/8/8/8/8/PPPPPPPP/RNBQK2R w KQkq - 0 1").unwrap();
+        let pos = Position::from_fen("rnbqk2r/pppppppp/8/8/8/8/PPPPPPPP/RNBQK2R w KQkq - 0 1").unwrap();
         let mv = BookMove((4 << 6) | 7);
         assert!(mv.is_castling(&pos));
         assert_eq!(mv.uci(&pos, true), "e1h1");

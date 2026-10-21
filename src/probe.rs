@@ -1,3 +1,5 @@
+
+
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::thread;
@@ -20,10 +22,7 @@ fn parse_fen_for_eval(fen: &str) -> Option<(SqPieces, Color)> {
     let mut file: i32 = 0;
     for c in placement.chars() {
         match c {
-            '/' => {
-                rank -= 1;
-                file = 0;
-            }
+            '/' => { rank -= 1; file = 0; }
             '1'..='8' => file += (c as i32) - ('0' as i32),
             _ => {
                 if let Some((piece, color)) = Piece::from_char(c) {
@@ -43,11 +42,7 @@ fn parse_fen_for_eval(fen: &str) -> Option<(SqPieces, Color)> {
     if kings != [true, true] {
         return None;
     }
-    let stm = if stm_str == "b" {
-        Color::Black
-    } else {
-        Color::White
-    };
+    let stm = if stm_str == "b" { Color::Black } else { Color::White };
     Some((sq_piece, stm))
 }
 
@@ -55,7 +50,8 @@ fn eval_fen(net: &nnue::Net, fen: &str) -> Option<i32> {
     let (sq_piece, stm) = parse_fen_for_eval(fen)?;
     let mut acc = DualAccumulator::zeroed();
     nnue::refresh_all(net, &sq_piece, &mut acc);
-    Some(nnue::evaluate_with_net(net, &acc, stm))
+    let pieces = sq_piece.iter().filter(|s| s.is_some()).count() as u32;
+    Some(nnue::evaluate_with_net(net, &acc, stm, pieces))
 }
 
 pub fn run_single(fen: &str) {

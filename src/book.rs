@@ -1,3 +1,5 @@
+
+
 use crate::board::{Board, Color, Piece};
 use crate::fbk;
 use crate::moves::Move;
@@ -11,12 +13,12 @@ pub fn fbk_position(board: &Board) -> fbk::Position {
                 Color::Black => fbk::Color::Black,
             };
             let piece = match piece {
-                Piece::Pawn => fbk::Piece::Pawn,
+                Piece::Pawn   => fbk::Piece::Pawn,
                 Piece::Knight => fbk::Piece::Knight,
                 Piece::Bishop => fbk::Piece::Bishop,
-                Piece::Rook => fbk::Piece::Rook,
-                Piece::Queen => fbk::Piece::Queen,
-                Piece::King => fbk::Piece::King,
+                Piece::Rook   => fbk::Piece::Rook,
+                Piece::Queen  => fbk::Piece::Queen,
+                Piece::King   => fbk::Piece::King,
             };
             (color, piece)
         });
@@ -45,11 +47,7 @@ pub fn fbk_pick(book: &fbk::Book, board: &Board, rand: u64) -> Option<Move> {
 pub fn fbk_moves(book: &fbk::Book, board: &Board) -> Vec<(Move, u32)> {
     book.probe(fbk_position(board).key())
         .into_iter()
-        .filter_map(|e| {
-            board
-                .find_uci_move(&e.mv.to_string())
-                .map(|m| (m, e.games()))
-        })
+        .filter_map(|e| board.find_uci_move(&e.mv.to_string()).map(|m| (m, e.games())))
         .collect()
 }
 
@@ -91,10 +89,7 @@ mod tests {
         b.apply_moves(&["g1b1"]);
         assert_eq!(fbk_position(&b).key(), 0xd428_c5dc_72ec_f425, "white O-O-O");
 
-        assert_eq!(
-            fbk_position(&b).key(),
-            fbk::key_from_fen(&b.to_fen()).unwrap()
-        );
+        assert_eq!(fbk_position(&b).key(), fbk::key_from_fen(&b.to_fen()).unwrap());
         assert_eq!(
             fbk_position(&Board::start_pos()).key(),
             0xa49d_4ce9_1cd6_b7ce,
@@ -165,13 +160,8 @@ mod tests {
         let d4 = (11 << 6) | 27;
         let bad = (12 << 6) | 36;
         let book = fbk_book(&[(key, e4, 5), (key, d4, 2), (key, bad, 1)]);
-        let moves: Vec<(String, u32)> = fbk_moves(&book, &b)
-            .into_iter()
-            .map(|(m, g)| (m.to_uci(), g))
-            .collect();
-        assert_eq!(
-            moves,
-            vec![("e2e4".to_string(), 5), ("d2d4".to_string(), 2)]
-        );
+        let moves: Vec<(String, u32)> =
+            fbk_moves(&book, &b).into_iter().map(|(m, g)| (m.to_uci(), g)).collect();
+        assert_eq!(moves, vec![("e2e4".to_string(), 5), ("d2d4".to_string(), 2)]);
     }
 }

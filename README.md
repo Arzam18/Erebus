@@ -73,12 +73,18 @@ next (decayed at the start of each search). `ucinewgame` clears them.
 |---|---|---|---|
 | `Hash` | spin | 16 | TT size in MB (1–1024) |
 | `Threads` | spin | 1 | Search threads (1–512) |
-| `Ponder` | check | true | See [Pondering](#pondering) |
+| `Ponder` | check | false | See [Pondering](#pondering) |
+| `MultiPV` | spin | 1 | Number of best lines to search and report (1–256), each as `info ... multipv N ...`. Analysis aid: extra lines cost search time. At 1 the output has no `multipv` field |
 | `Move Overhead` | spin | 30 | ms reserved per move for GUI / network lag (0–5000); raise it if the engine still loses on time. `MoveOverhead` is accepted too |
-| `SyzygyPath` | string | `<empty>` | One or more directories, `;`-separated |
+| `SyzygyPath` | string | `<empty>` | One or more directories, `;`-separated. Reports `info string Syzygy: found N WDL and N DTZ files, up to K-piece tablebases` |
+| `SyzygyProbeDepth` | spin | 1 | Minimum remaining depth for in-search probes (1–100); positions with fewer pieces than `SyzygyProbeLimit` are probed at any depth |
+| `Syzygy50MoveRule` | check | `true` | Treat wins and losses that the 50-move rule turns into draws as draws |
+| `SyzygyProbeLimit` | spin | 7 | Maximum number of pieces to probe (0–7); 0 disables tablebase use |
 | `EvalFile` | string | `<embedded>` | Diagnostic: load a different net of the same architecture from disk |
-| `OwnBook` | check | `false` | Play moves from `BookFile` instantly while in book (not during `go ponder` / `go infinite`) |
-| `BookFile` | string | `<empty>` | Polyglot `.bin` opening book; moves are picked at random, weighted by the book |
+| `UCI_Chess960` | check | `false` | Castling in king-takes-rook notation (`e1h1`) for Chess960 GUIs. Castling from any start square works regardless; FENs may use `KQkq` / X-FEN or Shredder-FEN (`HAha`) castling fields |
+| `OwnBook` | check | `false` | Play book moves instantly while in book (not during `go ponder` / `go infinite`): from `FrcBook` when `UCI_Chess960` is on, otherwise from `Book` |
+| `Book` | string | `book.fbk` | FBK opening book for standard chess, `<empty>` for none. A relative path is looked up in the working directory, then next to the executable |
+| `FrcBook` | string | `frcbook.fbk` | FBK opening book for Chess960 |
 | `SeePruneDepth` | spin | 3 | Tuning: max depth for SEE pruning (0 disables it) |
 | `SeeNoisyMargin` | spin | 120 | Tuning: SEE pruning margin for captures/promotions, cp per ply (depth ≤ 3) |
 | `SeeQuietMargin` | spin | 60 | Tuning: SEE pruning margin for quiet moves, cp per ply; 1000 disables it |
@@ -171,8 +177,8 @@ scores; the stored move is the one played.
 |---|---|---|
 | `--games N` | 10000 | Games to play |
 | `--nodes N` | 5000 | Soft node budget per move, jittered to N–1.5N |
-| `--book FILE` | `books/TCEC26.bin` | Polyglot opening book (`none` to disable) |
-| `--book-uniform` | off | Pick book moves uniformly instead of by weight |
+| `--book FILE` | none | FBK opening book, played from the start position |
+| `--book-uniform` | off | Pick book moves uniformly instead of by game count |
 | `--random-plies N` | 4 | Random legal moves after leaving the book |
 | `--seed N` | clock | RNG seed (thread N uses a derived seed) |
 | `--hash MB` | 16 | Transposition table per thread |
@@ -203,7 +209,8 @@ and TB scores fall outside the trainer's |score| ≤ 10000 filter.
 | `see.rs` | Static exchange evaluation |
 | `tt.rs` | Transposition table |
 | `syzygy.rs` | Tablebase probing via `shakmaty-syzygy` |
-| `book.rs` | Polyglot opening book probing (`OwnBook`, datagen) |
+| `book.rs` | FBK opening books (`OwnBook`, datagen) |
+| `fbk.rs` | FBK book reader, copied unchanged from frc-bookbuilder (`rust/src/lib.rs`) |
 | `datagen.rs` | Self-play training data generation (binpacks via `sfbinpack`) |
 | `probe.rs` | Standalone NNUE probe modes |
 | `zobrist.rs` | Compile-time Zobrist keys |

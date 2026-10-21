@@ -1,31 +1,33 @@
-use std::sync::Arc;
+
+
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::board::{Board, Color, Piece};
-use crate::eval::{DRAW_SCORE, INF, MATE_SCORE, evaluate};
+use crate::eval::{evaluate, DRAW_SCORE, INF, MATE_SCORE};
 use crate::movegen::MoveGen;
 use crate::moves::{Move, MoveList};
 use crate::see::see;
-use crate::syzygy::{SyzygyTb, TB_WIN_SCORE, WdlResult, tb_wdl_score};
-use crate::tt::{Bound, EVAL_NONE, TranspositionTable};
+use crate::syzygy::{self, tb_wdl_score, SyzygyTb, WdlResult, TB_WIN_SCORE};
+use crate::tt::{Bound, TranspositionTable, EVAL_NONE};
 
 const MAX_PLY: usize = 128;
 
-const SCORE_TT_MOVE: i32 = 200_000;
-const SCORE_PROMO_BASE: i32 = 60_000;
+const SCORE_TT_MOVE:      i32 = 200_000;
+const SCORE_PROMO_BASE:   i32 = 60_000;
 const SCORE_CAPTURE_BASE: i32 = 40_000;
-const SCORE_KILLER_1: i32 = 25_000;
-const SCORE_KILLER_2: i32 = 20_000;
-const SCORE_COUNTER: i32 = 18_000;
+const SCORE_KILLER_1:     i32 = 25_000;
+const SCORE_KILLER_2:     i32 = 20_000;
+const SCORE_COUNTER:      i32 = 18_000;
 
 const MAX_HISTORY: i32 = 16_384;
-const MAX_BONUS: i32 = 2_000;
+const MAX_BONUS:   i32 = 2_000;
 
-const CORR_SIZE: usize = 16_384;
+const CORR_SIZE:  usize = 16_384;
 const CORR_GRAIN: i32 = 256;
 const CORR_SCALE: i32 = 256;
-const CORR_MAX: i32 = CORR_GRAIN * 64;
+const CORR_MAX:   i32 = CORR_GRAIN * 64;
 
 type CorrTable = [[i32; CORR_SIZE]; 2];
 
@@ -33,8 +35,7 @@ type CorrTable = [[i32; CORR_SIZE]; 2];
 fn pawn_corr_index(board: &Board) -> usize {
     let w = board.pieces[Color::White as usize][Piece::Pawn as usize];
     let b = board.pieces[Color::Black as usize][Piece::Pawn as usize];
-    let h = w.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F).rotate_left(29);
+    let h = w.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F).rotate_left(29);
     (h.wrapping_mul(0xFF51_AFD7_ED55_8CCD) >> 50) as usize
 }
 
@@ -50,21 +51,21 @@ pub static SEE_NOISY_MARGIN: AtomicI32 = AtomicI32::new(SEE_NOISY_MARGIN_DEFAULT
 pub static SEE_QUIET_MARGIN: AtomicI32 = AtomicI32::new(SEE_QUIET_MARGIN_DEFAULT);
 
 const RFP_MAX_DEPTH: u32 = 6;
-const RFP_MARGIN: i32 = 75;
+const RFP_MARGIN:    i32 = 75;
 
-const NMP_MIN_DEPTH: u32 = 3;
+const NMP_MIN_DEPTH:   u32 = 3;
 const NMP_EVAL_MARGIN: i32 = 30;
 
 const FP_MAX_DEPTH: u32 = 3;
-const FP_MARGIN: i32 = 90;
+const FP_MARGIN:    i32 = 90;
 
 const LMP_MAX_DEPTH: u32 = 5;
 
 const HP_MAX_DEPTH: u32 = 4;
-const HP_MARGIN: i32 = 2_048;
+const HP_MARGIN:    i32 = 2_048;
 
 const RAZORING_MAX_DEPTH: u32 = 3;
-const RAZORING_MARGIN: i32 = 150;
+const RAZORING_MARGIN:    i32 = 150;
 
 const ASP_MIN_DEPTH: u32 = 5;
 const ASP_START_DELTA: i32 = 12;
@@ -95,50 +96,53 @@ fn history_bonus(depth: u32) -> i32 {
 }
 
 pub struct SearchLimits {
-    pub max_depth: u32,
-    pub move_time: Option<Duration>,
-    pub soft_time: Option<Duration>,
-    pub nodes: Option<u64>,
+    pub max_depth:        u32,
+    pub move_time:        Option<Duration>,
+    pub soft_time:        Option<Duration>,
+    pub nodes:            Option<u64>,
 
-    pub soft_nodes: Option<u64>,
-    pub infinite: bool,
+    pub soft_nodes:       Option<u64>,
+    pub infinite:         bool,
 
-    pub ponder: bool,
+    pub ponder:           bool,
     pub ponder_move_time: Option<Duration>,
     pub ponder_soft_time: Option<Duration>,
 
-    pub start: Option<Instant>,
+    pub start:            Option<Instant>,
 
-    pub quiet: bool,
+    pub quiet:            bool,
+
+    pub multipv:          usize,
 }
 
 impl Default for SearchLimits {
     fn default() -> Self {
         SearchLimits {
-            max_depth: 64,
-            move_time: None,
-            soft_time: None,
-            nodes: None,
-            soft_nodes: None,
-            infinite: false,
-            ponder: false,
+            max_depth:        64,
+            move_time:        None,
+            soft_time:        None,
+            nodes:            None,
+            soft_nodes:       None,
+            infinite:         false,
+            ponder:           false,
             ponder_move_time: None,
             ponder_soft_time: None,
-            start: None,
-            quiet: false,
+            start:            None,
+            quiet:            false,
+            multipv:          1,
         }
     }
 }
 
 struct PvTable {
-    table: [[Move; MAX_PLY]; MAX_PLY],
+    table:  [[Move; MAX_PLY]; MAX_PLY],
     length: [usize; MAX_PLY],
 }
 
 impl PvTable {
     fn new() -> Self {
         PvTable {
-            table: [[Move::NULL; MAX_PLY]; MAX_PLY],
+            table:  [[Move::NULL; MAX_PLY]; MAX_PLY],
             length: [0; MAX_PLY],
         }
     }
@@ -154,25 +158,17 @@ impl PvTable {
     }
 
     #[inline]
-    fn clear(&mut self, ply: usize) {
-        self.length[ply] = 0;
-    }
+    fn clear(&mut self, ply: usize) { self.length[ply] = 0; }
 
-    fn root_pv_string(&self, board: &Board) -> String {
-        self.table[0][..self.length[0]]
-            .iter()
-            .map(|&m| board.move_to_uci(m))
-            .collect::<Vec<_>>()
-            .join(" ")
+    fn root_pv(&self) -> Vec<Move> {
+        self.table[0][..self.length[0]].to_vec()
     }
+}
 
-    fn ponder_move(&self) -> Move {
-        if self.length[0] >= 2 {
-            self.table[0][1]
-        } else {
-            Move::NULL
-        }
-    }
+struct RootLine {
+    mv:    Move,
+    score: i32,
+    pv:    Vec<Move>,
 }
 
 type HistoryTable = [[[[[i32; 2]; 2]; 64]; 64]; 2];
@@ -180,17 +176,17 @@ type HistoryTable = [[[[[i32; 2]; 2]; 64]; 64]; 2];
 type CounterTable = [[Move; 64]; 64];
 
 pub struct SearchTables {
-    history: Box<HistoryTable>,
+    history:       Box<HistoryTable>,
     counter_moves: Box<CounterTable>,
-    pawn_corr: Box<CorrTable>,
+    pawn_corr:     Box<CorrTable>,
 }
 
 impl Default for SearchTables {
     fn default() -> Self {
         SearchTables {
-            history: Box::new([[[[[0i32; 2]; 2]; 64]; 64]; 2]),
+            history:       Box::new([[[[[0i32; 2]; 2]; 64]; 64]; 2]),
             counter_moves: Box::new([[Move::NULL; 64]; 64]),
-            pawn_corr: Box::new([[0; CORR_SIZE]; 2]),
+            pawn_corr:     Box::new([[0; CORR_SIZE]; 2]),
         }
     }
 }
@@ -210,80 +206,86 @@ fn decay_history(h: &mut HistoryTable) {
 }
 
 pub struct Searcher {
-    pub nodes: u64,
+    pub nodes:     u64,
 
     nodes_flushed: u64,
-    pub start: Instant,
+    pub start:     Instant,
 
-    clock: Instant,
-    pub limits: SearchLimits,
+    clock:         Instant,
+    pub limits:    SearchLimits,
     pub best_move: Move,
 
-    saved_ponder: Move,
+    saved_ponder:  Move,
 
-    pv_root: Move,
+    pv_root:       Move,
 
-    last_score: i32,
+    last_score:    i32,
     pub thread_id: usize,
 
     root_hist_len: usize,
 
+    root_excluded: Vec<Move>,
+
+    root_tb:       Vec<Move>,
+
     stopped: bool,
 
-    pv: PvTable,
-    killers: [[Move; 2]; MAX_PLY],
-    history: Box<HistoryTable>,
+    pv:            PvTable,
+    killers:       [[Move; 2]; MAX_PLY],
+    history:       Box<HistoryTable>,
     counter_moves: Box<CounterTable>,
-    pawn_corr: Box<CorrTable>,
-    lmr: [[i32; 64]; 64],
-    see_prune_depth: u32,
+    pawn_corr:     Box<CorrTable>,
+    lmr:           [[i32; 64]; 64],
+    see_prune_depth:  u32,
     see_noisy_margin: i32,
     see_quiet_margin: i32,
 
-    tt: Arc<TranspositionTable>,
-    tb: Arc<Option<SyzygyTb>>,
+    tt:            Arc<TranspositionTable>,
+    tb:            Arc<Option<SyzygyTb>>,
 
-    tbhits: Arc<AtomicU64>,
+    tbhits:        Arc<AtomicU64>,
 
-    nodes_global: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-    ponderhit: Arc<AtomicBool>,
+    nodes_global:  Arc<AtomicU64>,
+    stop:          Arc<AtomicBool>,
+    ponderhit:     Arc<AtomicBool>,
 }
 
 impl Searcher {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        limits: SearchLimits,
-        tt: Arc<TranspositionTable>,
-        tb: Arc<Option<SyzygyTb>>,
-        tbhits: Arc<AtomicU64>,
-        nodes_global: Arc<AtomicU64>,
-        stop: Arc<AtomicBool>,
-        ponderhit: Arc<AtomicBool>,
-        tables: SearchTables,
-        thread_id: usize,
+        limits:        SearchLimits,
+        tt:            Arc<TranspositionTable>,
+        tb:            Arc<Option<SyzygyTb>>,
+        tbhits:        Arc<AtomicU64>,
+        nodes_global:  Arc<AtomicU64>,
+        stop:          Arc<AtomicBool>,
+        ponderhit:     Arc<AtomicBool>,
+        tables:        SearchTables,
+        thread_id:     usize,
     ) -> Self {
         let t0 = limits.start.unwrap_or_else(Instant::now);
         Searcher {
-            nodes: 0,
+            nodes:     0,
             nodes_flushed: 0,
-            start: t0,
-            clock: t0,
+            start:     t0,
+            clock:     t0,
             limits,
             best_move: Move::NULL,
             saved_ponder: Move::NULL,
-            pv_root: Move::NULL,
-            last_score: 0,
+            pv_root:      Move::NULL,
+            last_score:   0,
             thread_id,
             root_hist_len: 0,
-            stopped: false,
-            pv: PvTable::new(),
-            killers: [[Move::NULL; 2]; MAX_PLY],
-            history: tables.history,
+            root_excluded: Vec::new(),
+            root_tb:       Vec::new(),
+            stopped:   false,
+            pv:            PvTable::new(),
+            killers:       [[Move::NULL; 2]; MAX_PLY],
+            history:       tables.history,
             counter_moves: tables.counter_moves,
-            pawn_corr: tables.pawn_corr,
-            lmr: build_lmr_table(),
-            see_prune_depth: SEE_PRUNE_DEPTH.load(Ordering::Relaxed) as u32,
+            pawn_corr:     tables.pawn_corr,
+            lmr:           build_lmr_table(),
+            see_prune_depth:  SEE_PRUNE_DEPTH.load(Ordering::Relaxed) as u32,
             see_noisy_margin: SEE_NOISY_MARGIN.load(Ordering::Relaxed),
             see_quiet_margin: SEE_QUIET_MARGIN.load(Ordering::Relaxed),
             tt,
@@ -297,9 +299,9 @@ impl Searcher {
 
     pub fn into_tables(self) -> SearchTables {
         SearchTables {
-            history: self.history,
+            history:       self.history,
             counter_moves: self.counter_moves,
-            pawn_corr: self.pawn_corr,
+            pawn_corr:     self.pawn_corr,
         }
     }
 
@@ -321,37 +323,22 @@ impl Searcher {
     }
 
     fn time_up(&mut self) -> bool {
-        if self.stopped {
-            return true;
-        }
+        if self.stopped { return true; }
         self.check_ponderhit();
         let hit = self.stop.load(Ordering::Relaxed)
-            || self
-                .limits
-                .move_time
-                .is_some_and(|mt| self.clock.elapsed() >= mt)
+            || self.limits.move_time.is_some_and(|mt| self.clock.elapsed() >= mt)
             || self.limits.nodes.is_some_and(|n| self.nodes >= n);
-        if hit {
-            self.stopped = true;
-        }
+        if hit { self.stopped = true; }
         hit
     }
 
     fn check_ponderhit(&mut self) {
-        if !(self.limits.ponder && self.limits.infinite) {
-            return;
-        }
-        if !self.ponderhit.load(Ordering::Relaxed) {
-            return;
-        }
-        self.limits.infinite = false;
-        self.limits.move_time = self
-            .limits
-            .ponder_move_time
+        if !(self.limits.ponder && self.limits.infinite) { return; }
+        if !self.ponderhit.load(Ordering::Relaxed) { return; }
+        self.limits.infinite  = false;
+        self.limits.move_time = self.limits.ponder_move_time
             .or(Some(Duration::from_millis(1000)));
-        self.limits.soft_time = self
-            .limits
-            .ponder_soft_time
+        self.limits.soft_time = self.limits.ponder_soft_time
             .or(Some(Duration::from_millis(500)));
         self.clock = Instant::now();
     }
@@ -359,12 +346,8 @@ impl Searcher {
     fn soft_time_up(&mut self, board: &mut Board, score: i32) -> bool {
         self.check_ponderhit();
 
-        if self.limits.infinite {
-            return false;
-        }
-        let Some(soft) = self.limits.soft_time else {
-            return false;
-        };
+        if self.limits.infinite { return false; }
+        let Some(soft) = self.limits.soft_time else { return false; };
 
         let mut budget = soft;
         let complexity = (score - evaluate(board)).abs().min(200) as f64;
@@ -386,7 +369,10 @@ impl Searcher {
 
         let mut root_moves = MoveList::new();
         MoveGen::generate_all(board, &mut root_moves);
-        let mut best = if root_moves.is_empty() {
+        self.root_tb = self.tb_root_moves(board, &root_moves);
+        let mut best = if let Some(&mv) = self.root_tb.first() {
+            mv
+        } else if root_moves.is_empty() {
             Move::NULL
         } else {
             root_moves[0]
@@ -401,23 +387,53 @@ impl Searcher {
 
         let mut prev_score = 0i32;
 
-        for depth in start_depth..=self.limits.max_depth.min(MAX_PLY as u32 - 2) {
-            let score = self.aspiration(board, depth, prev_score);
+        let root_count = if self.root_tb.is_empty() { root_moves.len() } else { self.root_tb.len() };
+        let num_lines = self.limits.multipv.clamp(1, root_count.max(1));
 
-            if self.time_up() {
-                if !self.best_move.is_null() {
-                    best = self.best_move;
+        let mut prev_lines: Vec<RootLine> = Vec::new();
+
+        for depth in start_depth..=self.limits.max_depth.min(MAX_PLY as u32 - 2) {
+
+            let mut lines: Vec<RootLine> = Vec::with_capacity(num_lines);
+            let mut interrupted = false;
+            self.root_excluded.clear();
+            for k in 0..num_lines {
+                let centre = prev_lines.get(k).map_or(prev_score, |l| l.score);
+                if k > 0 {
+                    self.best_move = Move::NULL;
                 }
+                let score = self.aspiration(board, depth, centre);
+                if self.time_up() {
+                    interrupted = true;
+                    break;
+                }
+
+                let mv = self.best_move;
+                if mv.is_null() {
+                    break;
+                }
+                lines.push(RootLine { mv, score, pv: self.pv.root_pv() });
+                self.root_excluded.push(mv);
+            }
+            self.root_excluded.clear();
+
+            if lines.is_empty() {
+
+                if !self.best_move.is_null() { best = self.best_move; }
+                self.best_move = best;
                 break;
             }
 
-            best = self.best_move;
+            lines.sort_by_key(|l| std::cmp::Reverse(l.score));
+            let score = lines[0].score;
+            best = lines[0].mv;
+            self.best_move = best;
             prev_score = score;
             self.last_score = score;
 
-            let pm = self.pv.ponder_move();
-            if !pm.is_null() {
-                self.saved_ponder = pm;
+            let top_pv = &lines[0].pv;
+            if top_pv.len() >= 2 && top_pv[0] == best {
+                self.saved_ponder = top_pv[1];
                 self.pv_root = best;
             }
 
@@ -425,31 +441,34 @@ impl Searcher {
                 self.flush_nodes();
                 let total_nodes = self.nodes_global.load(Ordering::Relaxed);
                 let elapsed_ms = self.start.elapsed().as_millis();
-                let nps = (total_nodes as u128 * 1000)
-                    .checked_div(elapsed_ms)
-                    .unwrap_or(0);
-                println!(
-                    "info depth {} score {} nodes {} nps {} hashfull {} tbhits {} time {} pv {}",
-                    depth,
-                    score_str(score),
-                    total_nodes,
-                    nps,
-                    self.tt.hashfull(),
-                    self.tbhits.load(Ordering::Relaxed),
-                    elapsed_ms,
-                    self.pv.root_pv_string(board),
-                );
+                let nps = (total_nodes as u128 * 1000).checked_div(elapsed_ms).unwrap_or(0);
+                for (k, line) in lines.iter().enumerate() {
+
+                    let multipv = if num_lines > 1 { format!(" multipv {}", k + 1) } else { String::new() };
+                    let pv = line.pv.iter().map(|&m| board.move_to_uci(m)).collect::<Vec<_>>().join(" ");
+                    println!(
+                        "info depth {}{} score {} nodes {} nps {} hashfull {} tbhits {} time {} pv {}",
+                        depth,
+                        multipv,
+                        score_str(line.score),
+                        total_nodes,
+                        nps,
+                        self.tt.hashfull(),
+                        self.tbhits.load(Ordering::Relaxed),
+                        elapsed_ms,
+                        pv,
+                    );
+                }
             }
 
-            if score.abs() >= MATE_SCORE - MAX_PLY as i32 {
+            if interrupted {
                 break;
             }
-            if self.limits.soft_nodes.is_some_and(|n| self.nodes >= n) {
-                break;
-            }
-            if depth >= 4 && self.soft_time_up(board, score) {
-                break;
-            }
+            prev_lines = lines;
+
+            if num_lines == 1 && score.abs() >= MATE_SCORE - MAX_PLY as i32 { break; }
+            if self.limits.soft_nodes.is_some_and(|n| self.nodes >= n) { break; }
+            if depth >= 4 && self.soft_time_up(board, score) { break; }
         }
 
         if self.pv_root != best {
@@ -459,9 +478,7 @@ impl Searcher {
         if self.thread_id == 0 {
             loop {
                 self.check_ponderhit();
-                if !self.limits.infinite || self.stop.load(Ordering::Relaxed) {
-                    break;
-                }
+                if !self.limits.infinite || self.stop.load(Ordering::Relaxed) { break; }
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
@@ -477,31 +494,23 @@ impl Searcher {
 
         let mut delta = ASP_START_DELTA;
         let mut alpha = (prev_score - delta).max(-INF);
-        let mut beta = (prev_score + delta).min(INF);
+        let mut beta  = (prev_score + delta).min(INF);
         let mut search_depth = depth;
 
         loop {
-            if alpha < -2000 {
-                alpha = -INF;
-            }
-            if beta > 2000 {
-                beta = INF;
-            }
+            if alpha < -2000 { alpha = -INF; }
+            if beta  >  2000 { beta  =  INF; }
 
             let score = self.negamax(board, search_depth, alpha, beta, 0, false);
-            if self.time_up() {
-                return score;
-            }
+            if self.time_up() { return score; }
 
             if score <= alpha {
-                beta = (alpha + beta) / 2;
+                beta  = (alpha + beta) / 2;
                 alpha = (alpha - delta).max(-INF);
                 search_depth = depth;
             } else if score >= beta {
                 beta = (beta + delta).min(INF);
-                if search_depth > 1 {
-                    search_depth -= 1;
-                }
+                if search_depth > 1 { search_depth -= 1; }
             } else {
                 return score;
             }
@@ -511,12 +520,12 @@ impl Searcher {
 
     fn negamax(
         &mut self,
-        board: &mut Board,
+        board:     &mut Board,
         mut depth: u32,
         mut alpha: i32,
-        mut beta: i32,
-        ply: usize,
-        was_null: bool,
+        mut beta:  i32,
+        ply:       usize,
+        was_null:  bool,
     ) -> i32 {
         if ply < MAX_PLY {
             self.pv.clear(ply);
@@ -538,7 +547,7 @@ impl Searcher {
 
         if ply > 0 {
             alpha = alpha.max(-(MATE_SCORE - ply as i32));
-            beta = beta.min(MATE_SCORE - ply as i32 - 1);
+            beta  = beta.min(MATE_SCORE - ply as i32 - 1);
             if alpha >= beta {
                 return alpha;
             }
@@ -551,18 +560,18 @@ impl Searcher {
 
         let is_pv = beta - alpha > 1;
 
-        let mut tt_move = Move::NULL;
+        let mut tt_move  = Move::NULL;
         let mut tt_score = 0i32;
         let mut tt_bound: Option<Bound> = None;
-        let mut tt_eval = EVAL_NONE;
+        let mut tt_eval  = EVAL_NONE;
         if let Some(e) = self.tt.probe(board.hash) {
-            tt_move = e.mv;
-            tt_eval = e.eval;
+            tt_move  = e.mv;
+            tt_eval  = e.eval;
             tt_score = TranspositionTable::score_from_tt(e.score, ply);
             tt_bound = Some(e.bound);
             if e.depth as u32 >= depth && !is_pv && ply > 0 {
                 let usable = match e.bound {
-                    Bound::Exact => true,
+                    Bound::Exact      => true,
                     Bound::Lower => tt_score >= beta,
                     Bound::Upper => tt_score <= alpha,
                 };
@@ -588,11 +597,7 @@ impl Searcher {
         } else {
             evaluate(board)
         };
-        let mut static_eval = if in_check {
-            -INF
-        } else {
-            self.corrected_eval(board, raw_eval)
-        };
+        let mut static_eval = if in_check { -INF } else { self.corrected_eval(board, raw_eval) };
 
         let corr_eval = static_eval;
 
@@ -604,20 +609,25 @@ impl Searcher {
             }
         }
 
-        if !in_check
+        let mut tb_floor = -INF;
+        let mut tb_ceil  = INF;
+        if ply > 0
+            && !in_check
             && let Some(tb) = self.tb.as_ref()
+            && let pieces = board.occupied().count_ones() as usize
+            && pieces <= tb.card()
+            && (pieces < tb.card() || depth >= syzygy::probe_depth())
             && let Some(wdl) = tb.probe_wdl(board)
         {
+            let wdl = if syzygy::rule50() { wdl } else { wdl.without_rule50() };
             self.tbhits.fetch_add(1, Ordering::Relaxed);
-
             let decisive = matches!(wdl, WdlResult::Win | WdlResult::Loss);
-            let dtz = if decisive { tb.probe_dtz(board) } else { None };
-            let score = tb_wdl_score(wdl, dtz, ply);
+            let score = tb_wdl_score(wdl, ply);
 
             let bound = match wdl {
-                WdlResult::Win => Bound::Lower,
+                WdlResult::Win  => Bound::Lower,
                 WdlResult::Loss => Bound::Upper,
-                _ => Bound::Exact,
+                _               => Bound::Exact,
             };
             self.tt.store(
                 board.hash,
@@ -630,11 +640,13 @@ impl Searcher {
             if !is_pv || !decisive {
                 return score;
             }
-            if score >= beta {
-                return score;
-            }
-            if score > alpha {
-                alpha = score;
+            if wdl == WdlResult::Win {
+                if score >= beta { return score; }
+                tb_floor = score;
+                alpha = alpha.max(score);
+            } else {
+                if score <= alpha { return score; }
+                tb_ceil = score;
             }
         }
 
@@ -655,9 +667,7 @@ impl Searcher {
             && static_eval + RAZORING_MARGIN * depth as i32 <= alpha
         {
             let razor = self.quiescence(board, alpha, beta, ply);
-            if self.time_up() {
-                return 0;
-            }
+            if self.time_up() { return 0; }
             if razor <= alpha {
                 return razor;
             }
@@ -683,26 +693,16 @@ impl Searcher {
                 true,
             );
             board.unmake_null_move();
-            if self.time_up() {
-                return 0;
-            }
+            if self.time_up() { return 0; }
             if null_score >= beta {
-                return if null_score >= MATE_SCORE - MAX_PLY as i32 {
-                    beta
-                } else {
-                    null_score
-                };
+                return if null_score >= MATE_SCORE - MAX_PLY as i32 { beta } else { null_score };
             }
         }
 
         let mut moves = MoveList::new();
         MoveGen::generate_all(board, &mut moves);
         if moves.is_empty() {
-            return if in_check {
-                -(MATE_SCORE - ply as i32)
-            } else {
-                DRAW_SCORE
-            };
+            return if in_check { -(MATE_SCORE - ply as i32) } else { DRAW_SCORE };
         }
 
         let prev_mv = board.history.last().map(|&(m, _)| m).unwrap_or(Move::NULL);
@@ -724,14 +724,17 @@ impl Searcher {
         }
 
         let stm = board.side as usize;
+
+        let root_excl = ply == 0 && (!self.root_excluded.is_empty() || !self.root_tb.is_empty());
         let original_alpha = alpha;
-        let mut best_move = Move::NULL;
-        let mut best_score = -INF;
-        let mut bound = Bound::Upper;
-        let mut searched = 0u32;
+        let mut best_move  = Move::NULL;
+        let mut best_score  = -INF;
+        let mut bound       = Bound::Upper;
+        let mut searched    = 0u32;
         let mut quiets = MoveList::new();
 
         for i in 0..moves.len() {
+
             let mut best_j = i;
             for j in (i + 1)..moves.len() {
                 if scores[j] > scores[best_j] {
@@ -742,13 +745,19 @@ impl Searcher {
             scores.swap(i, best_j);
 
             let mv = moves[i];
+            if root_excl
+                && (self.root_excluded.contains(&mv)
+                    || (!self.root_tb.is_empty() && !self.root_tb.contains(&mv)))
+            {
+                continue;
+            }
             let from = mv.from() as usize;
-            let to = mv.to() as usize;
+            let to   = mv.to() as usize;
             let src_th = ((opp_threats >> from) & 1) as usize;
             let dst_th = ((opp_threats >> to) & 1) as usize;
             let is_noisy = mv.is_capture() || mv.is_promotion();
-            let is_killer =
-                ply < MAX_PLY && (mv == self.killers[ply][0] || mv == self.killers[ply][1]);
+            let is_killer = ply < MAX_PLY
+                && (mv == self.killers[ply][0] || mv == self.killers[ply][1]);
             let hist = self.history[stm][from][to][src_th][dst_th];
 
             let can_prune = !is_pv && !in_check && best_score > -INF;
@@ -762,7 +771,11 @@ impl Searcher {
                 continue;
             }
 
-            if can_prune && depth <= LMP_MAX_DEPTH && !is_noisy && searched >= 3 + depth * depth {
+            if can_prune
+                && depth <= LMP_MAX_DEPTH
+                && !is_noisy
+                && searched >= 3 + depth * depth
+            {
                 continue;
             }
 
@@ -774,7 +787,11 @@ impl Searcher {
                 continue;
             }
 
-            if !in_check && depth <= self.see_prune_depth && best_score > -INF {
+            if !in_check
+                && depth <= self.see_prune_depth
+                && best_score > -INF
+                && (ply > 0 || self.limits.multipv <= 1)
+            {
                 let margin = if is_noisy {
                     -self.see_noisy_margin * depth as i32
                 } else {
@@ -798,18 +815,10 @@ impl Searcher {
                 let d_idx = (depth as usize).min(63);
                 let m_idx = (searched as usize).min(63);
                 let mut r = self.lmr[d_idx][m_idx] - hist / 2048;
-                if !is_pv {
-                    r += 2;
-                }
-                if is_killer {
-                    r -= 2;
-                }
-                if gives_check {
-                    r -= 1;
-                }
-                if !is_noisy && src_th == 1 && dst_th == 0 {
-                    r -= 1;
-                }
+                if !is_pv { r += 2; }
+                if is_killer { r -= 2; }
+                if gives_check { r -= 1; }
+                if !is_noisy && src_th == 1 && dst_th == 0 { r -= 1; }
                 r = r.clamp(1, depth as i32 - 1);
 
                 score = -self.negamax(
@@ -842,7 +851,7 @@ impl Searcher {
 
             if score > best_score {
                 best_score = score;
-                best_move = mv;
+                best_move  = mv;
 
                 if ply == 0 && score > alpha {
                     self.best_move = mv;
@@ -853,6 +862,7 @@ impl Searcher {
             }
 
             if score >= beta {
+                let score = score.min(tb_ceil);
                 if !is_noisy {
                     if ply < MAX_PLY && self.killers[ply][0] != mv {
                         self.killers[ply][1] = self.killers[ply][0];
@@ -872,17 +882,19 @@ impl Searcher {
                         self.update_history(stm, qf, qt, qs, qd, -bonus);
                     }
                 }
-                if !in_check {
-                    self.update_corr(board, depth, raw_eval, corr_eval, score, Bound::Lower, mv);
+                if !root_excl {
+                    if !in_check {
+                        self.update_corr(board, depth, raw_eval, corr_eval, score, Bound::Lower, mv);
+                    }
+                    self.tt.store(
+                        board.hash,
+                        mv,
+                        TranspositionTable::score_to_tt(score, ply),
+                        raw_eval,
+                        depth as u8,
+                        Bound::Lower,
+                    );
                 }
-                self.tt.store(
-                    board.hash,
-                    mv,
-                    TranspositionTable::score_to_tt(score, ply),
-                    raw_eval,
-                    depth as u8,
-                    Bound::Lower,
-                );
                 return score;
             }
 
@@ -896,8 +908,10 @@ impl Searcher {
         }
 
         if best_score == -INF {
+
             best_score = alpha;
         }
+        best_score = best_score.clamp(tb_floor, tb_ceil);
 
         let store_bound = if best_score >= beta {
             Bound::Lower
@@ -906,25 +920,19 @@ impl Searcher {
         } else {
             bound
         };
-        if !in_check {
-            self.update_corr(
-                board,
-                depth,
-                raw_eval,
-                corr_eval,
-                best_score,
-                store_bound,
+        if !root_excl {
+            if !in_check {
+                self.update_corr(board, depth, raw_eval, corr_eval, best_score, store_bound, best_move);
+            }
+            self.tt.store(
+                board.hash,
                 best_move,
+                TranspositionTable::score_to_tt(best_score, ply),
+                raw_eval,
+                depth as u8,
+                store_bound,
             );
         }
-        self.tt.store(
-            board.hash,
-            best_move,
-            TranspositionTable::score_to_tt(best_score, ply),
-            raw_eval,
-            depth as u8,
-            store_bound,
-        );
 
         best_score
     }
@@ -947,11 +955,7 @@ impl Searcher {
 
         let in_check = board.in_check();
         if ply >= MAX_PLY - 1 {
-            return if in_check {
-                DRAW_SCORE
-            } else {
-                evaluate(board)
-            };
+            return if in_check { DRAW_SCORE } else { evaluate(board) };
         }
 
         let is_pv = beta - alpha > 1;
@@ -964,7 +968,7 @@ impl Searcher {
             if !is_pv && ply > 0 {
                 let tt_score = TranspositionTable::score_from_tt(e.score, ply);
                 let usable = match e.bound {
-                    Bound::Exact => true,
+                    Bound::Exact      => true,
                     Bound::Lower => tt_score >= beta,
                     Bound::Upper => tt_score <= alpha,
                 };
@@ -1064,11 +1068,7 @@ impl Searcher {
         }
 
         if !self.stopped {
-            let b = if best_score <= old_alpha {
-                Bound::Upper
-            } else {
-                Bound::Exact
-            };
+            let b = if best_score <= old_alpha { Bound::Upper } else { Bound::Exact };
             self.tt.store(
                 board.hash,
                 best_move,
@@ -1081,23 +1081,17 @@ impl Searcher {
         best_score
     }
 
-    fn score_move(
-        &self,
-        board: &Board,
-        mv: Move,
-        ply: usize,
-        opp_threats: u64,
-        counter: Move,
-    ) -> i32 {
+    fn score_move(&self, board: &Board, mv: Move, ply: usize, opp_threats: u64, counter: Move) -> i32 {
         let from = mv.from() as usize;
-        let to = mv.to() as usize;
+        let to   = mv.to() as usize;
 
         if mv.is_promotion() {
+
             let rank = match mv.promo_piece() {
-                Some(Piece::Queen) => 4,
-                Some(Piece::Rook) => 3,
+                Some(Piece::Queen)  => 4,
+                Some(Piece::Rook)   => 3,
                 Some(Piece::Bishop) => 2,
-                _ => 1,
+                _                   => 1,
             };
             return SCORE_PROMO_BASE + rank * 100;
         }
@@ -1109,12 +1103,8 @@ impl Searcher {
         }
 
         if ply < MAX_PLY {
-            if mv == self.killers[ply][0] {
-                return SCORE_KILLER_1;
-            }
-            if mv == self.killers[ply][1] {
-                return SCORE_KILLER_2;
-            }
+            if mv == self.killers[ply][0] { return SCORE_KILLER_1; }
+            if mv == self.killers[ply][1] { return SCORE_KILLER_2; }
         }
 
         if !counter.is_null() && mv == counter {
@@ -1135,12 +1125,12 @@ impl Searcher {
     #[allow(clippy::too_many_arguments)]
     fn update_corr(
         &mut self,
-        board: &Board,
-        depth: u32,
-        raw_eval: i32,
+        board:     &Board,
+        depth:     u32,
+        raw_eval:  i32,
         corr_eval: i32,
-        best: i32,
-        bound: Bound,
+        best:      i32,
+        bound:     Bound,
         best_move: Move,
     ) {
         if self.stopped
@@ -1158,18 +1148,11 @@ impl Searcher {
         *e = ((*e * (CORR_SCALE - w) + target * w) / CORR_SCALE).clamp(-CORR_MAX, CORR_MAX);
     }
 
-    fn update_history(
-        &mut self,
-        stm: usize,
-        from: usize,
-        to: usize,
-        s: usize,
-        d: usize,
-        bonus: i32,
-    ) {
+    fn update_history(&mut self, stm: usize, from: usize, to: usize, s: usize, d: usize, bonus: i32) {
         let clamped = bonus.clamp(-MAX_BONUS, MAX_BONUS);
         let cur = self.history[stm][from][to][s][d];
-        self.history[stm][from][to][s][d] = cur + clamped - (cur * clamped.abs()) / MAX_HISTORY;
+        self.history[stm][from][to][s][d] =
+            cur + clamped - (cur * clamped.abs()) / MAX_HISTORY;
     }
 
     fn see_ge(&self, board: &Board, mv: Move, threshold: i32) -> bool {
@@ -1191,12 +1174,9 @@ impl Searcher {
 
     pub(crate) fn is_material_draw(board: &Board) -> bool {
         let p = |c: Color, pc: Piece| board.pieces[c as usize][pc as usize];
-        if p(Color::White, Piece::Pawn)
-            | p(Color::Black, Piece::Pawn)
-            | p(Color::White, Piece::Rook)
-            | p(Color::Black, Piece::Rook)
-            | p(Color::White, Piece::Queen)
-            | p(Color::Black, Piece::Queen)
+        if p(Color::White, Piece::Pawn) | p(Color::Black, Piece::Pawn)
+            | p(Color::White, Piece::Rook) | p(Color::Black, Piece::Rook)
+            | p(Color::White, Piece::Queen) | p(Color::Black, Piece::Queen)
             != 0
         {
             return false;
@@ -1240,6 +1220,70 @@ impl Searcher {
         false
     }
 
+    fn tb_root_moves(&self, board: &mut Board, moves: &MoveList) -> Vec<Move> {
+        let Some(tb) = self.tb.as_ref() else { return Vec::new() };
+        if moves.is_empty()
+            || board.occupied().count_ones() as usize > tb.card()
+            || tb.probe_dtz_root(board).is_none()
+        {
+            return Vec::new();
+        }
+        let rule50 = syzygy::rule50();
+
+        const MATE: i64 = 4_000_000;
+        const WIN: i64 = 3_000_000;
+        const CURSED_WIN: i64 = 2_000_000;
+        const DRAW: i64 = 1_000_000;
+        const BLESSED_LOSS: i64 = 500_000;
+        let mut ranked: Vec<(i64, Move)> = Vec::with_capacity(moves.len());
+        for &mv in moves.iter() {
+            let zeroing = mv.is_capture()
+                || matches!(board.sq_piece[mv.from() as usize], Some((Piece::Pawn, _)));
+            let clock = if zeroing { 0 } else { board.halfmove as i32 + 1 };
+            board.make_move(mv);
+            let repeats = Self::seen_in_game(board);
+            let mut replies = MoveList::new();
+            MoveGen::generate_all(board, &mut replies);
+
+            let dtz = if replies.is_empty() {
+                Some(if board.in_check() { -1 } else { 0 })
+            } else {
+                tb.probe_dtz_root(board)
+            };
+            board.unmake_move();
+            let Some(dtz) = dtz else { return Vec::new() };
+            let mated = replies.is_empty() && dtz < 0;
+            let d = dtz.abs() as i64;
+            let key = if dtz < 0 && (mated || !rule50 || d + clock as i64 <= 100) {
+
+                if mated { MATE }
+                else { WIN - if zeroing { 0 } else { 2000 } - 2 * d - repeats as i64 }
+            } else if dtz < 0 {
+                CURSED_WIN
+            } else if dtz == 0 {
+                DRAW
+            } else if rule50 && d + clock as i64 > 100 {
+                BLESSED_LOSS
+            } else {
+                d
+            };
+            ranked.push((key, mv));
+        }
+        let best = ranked.iter().map(|r| r.0).max().unwrap_or(0);
+
+        let keep = |key: i64| if (DRAW..WIN / 2).contains(&best) { key >= DRAW } else { key == best };
+
+        ranked.sort_by_key(|r| std::cmp::Reverse(r.0));
+        ranked.into_iter().filter(|r| keep(r.0)).map(|r| r.1).collect()
+    }
+
+    fn seen_in_game(board: &Board) -> bool {
+        let hist = &board.history;
+        let n = hist.len();
+        let lookback = (board.halfmove as usize).min(n);
+        (2..=lookback).step_by(2).any(|k| hist[n - k].1.hash == board.hash)
+    }
+
     fn has_non_pawn_material(&self, board: &Board) -> bool {
         let us = board.side as usize;
         board.pieces[us][Piece::Knight as usize] != 0
@@ -1254,6 +1298,10 @@ fn score_str(score: i32) -> String {
         let moves_to_mate = (MATE_SCORE - score.abs() + 1) / 2;
         let sign = if score > 0 { "" } else { "-" };
         format!("mate {sign}{moves_to_mate}")
+    } else if score.abs() >= TB_WIN_SCORE - 1000 {
+
+        let cp = 20000 - (TB_WIN_SCORE - score.abs());
+        format!("cp {}", if score > 0 { cp } else { -cp })
     } else {
         format!("cp {score}")
     }
@@ -1265,10 +1313,7 @@ mod tests {
 
     fn mk_searcher() -> Searcher {
         Searcher::new(
-            SearchLimits {
-                max_depth: 6,
-                ..Default::default()
-            },
+            SearchLimits { max_depth: 6, ..Default::default() },
             Arc::new(TranspositionTable::new(8)),
             Arc::new(None),
             Arc::new(AtomicU64::new(0)),
