@@ -1,7 +1,15 @@
+<p align="center">
+  <img src="erebus-logo.png" alt="Erebus" width="400">
+</p>
+
+
 # Erebus
 
-A UCI chess engine written in Rust: bitboard move generation, an NNUE
-evaluation, and a modern alpha-beta search with Lazy SMP.
+A UCI engine that has been a passion project for many years. After many failed attempts in C and C++ (fighting the language), I decided to learn Rust and start from scratch with what I've learned and have a clean slate.  This is the result.  Version 2.1.x  was my initial release and had a barely modified network based on the bullet simple example. Fast to train and learn about NNUE.  Version 2.2.x  is my midlevel attempt, still somewhat simple but much stronger than the mini net.  Goal is to extend this further and eventually implement attack features and other recommendations that modern engines are now using. It is currently ranged \#125 on CCRL. 
+
+Enjoy!
+
+Disclosure: AI-assistance.  Initially utilized AI to help with inference code. It also found a bug in my syzygy probing that resulted in the game tree ignoring probe results and instead passed the first legal root move.  Explains some of the funny end games v2.1.1 users might have seen.
 
 ---
 
@@ -217,15 +225,16 @@ and TB scores fall outside the trainer's |score| ≤ 10000 filter.
 
 ---
 
-## Testing
+# Appreciation
 
-```bash
-cargo test --release
-```
+* All the users of <talkchess.com>, the knowledge and comradery over the years.
+* CCRL and it's testers and their dedication to computer chess.
+* <https://chessprogramming.org/> for it's wealth of knowledge and ideas
+* Niklas Fiekas for the wonderful rust shakmaty and shakmaty-syzygy crates for syzygy probing.
+* Ronald de Man for creating the syzygy egtbs.
+* Steinar H. Gunderson for hosting the massive syzygy dataset on <https://tablebase.sesse.net/>
+* Dr. Bob Hyatt who inspired me to get into this hobby in the late 90s.  Been hooked since.
 
-The suite covers perft on the standard positions, the legal generator against
-a make/unmake reference (move set and order), SIMD-vs-scalar NNUE
-equivalence, net sanity checks, and basic tactics.
 
 ## License
 
