@@ -5,7 +5,7 @@
 
 # Erebus
 
-A UCI engine that has been a passion project for many years. After many failed attempts in C and C++ (fighting the language), I decided to learn Rust and start from scratch with what I've learned and have a clean slate.  This is the result.  Version 2.1.x  was my initial release and had a barely modified network based on the bullet simple example. Fast to train and learn about NNUE.  Version 2.2.x  is my midlevel attempt, still somewhat simple but much stronger than the mini net.  Goal is to extend this further and eventually implement attack features and other recommendations that modern engines are now using. It is currently ranged \#125 on CCRL. 
+A UCI engine that has been a passion project for many years. After many failed attempts in C and C++ (fighting the language), I decided to learn Rust and start from scratch with what I've learned and have a clean slate.  This is the result.  Version 2.1.x  was my initial release and had a barely modified network based on the bullet simple example. Fast to train and learn about NNUE.  Version 2.2.x  is my midlevel attempt, still somewhat simple but much stronger than the mini net.  Goal is to extend this further and eventually implement attack features and other recommendations that modern engines are now using. It is currently ranted \#125 on CCRL. 
 
 Enjoy!
 
