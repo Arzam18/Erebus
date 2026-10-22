@@ -7,6 +7,7 @@ mod eval;
 
 #[allow(dead_code)]
 mod fbk;
+mod genfens;
 mod movegen;
 mod moves;
 mod nnue;
@@ -98,7 +99,13 @@ fn main() {
         eprintln!("info string Hash set to {hash_mb} MB via --hash");
     }
 
-    uci::uci_loop(syzygy_path, threads, hash_mb);
+    let commands: Vec<String> = if args.get(1).is_some_and(|a| !a.starts_with("--")) {
+        args[1..].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    uci::uci_loop(syzygy_path, threads, hash_mb, commands);
 }
 
 fn parse_flag_value(args: &[String], flag: &str) -> Option<String> {

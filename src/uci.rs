@@ -1,4 +1,4 @@
-use std::io::{self, BufRead};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -108,9 +108,18 @@ impl SmpState {
     }
 }
 
-pub fn uci_loop(syzygy_path: Option<String>, initial_threads: usize, initial_hash_mb: usize) {
-    let stdin = io::stdin();
-    let mut tt_mb          = initial_hash_mb;
+pub fn uci_loop(
+    syzygy_path: Option<String>,
+    initial_threads: usize,
+    initial_hash_mb: usize,
+    commands: Vec<String>,
+) {
+    let lines: Box<dyn Iterator<Item = String>> = if commands.is_empty() {
+        Box::new(io::stdin().lines().map_while(Result::ok))
+    } else {
+        Box::new(commands.into_iter())
+    };
+    let mut tt_mb         = initial_hash_mb;
     let mut num_threads    = initial_threads;
     let mut ponder_enabled = false;
     let mut move_overhead  = MOVE_OVERHEAD_DEFAULT;
@@ -128,8 +137,7 @@ pub fn uci_loop(syzygy_path: Option<String>, initial_threads: usize, initial_has
         load_syzygy(&mut smp, path);
     }
 
-    for line in stdin.lock().lines() {
-        let line = match line { Ok(l) => l, Err(_) => break };
+    for line in lines {
         let received_at = Instant::now();
         let line = line.trim().to_string();
         if line.is_empty() { continue; }
@@ -508,6 +516,10 @@ pub fn uci_loop(syzygy_path: Option<String>, initial_threads: usize, initial_has
             "fen"   => println!("{}", smp.board.lock().unwrap().to_fen()),
             "perft" => cmd_perft(&mut smp.board.lock().unwrap(), &tokens),
             "eval"  => cmd_eval(&mut smp.board.lock().unwrap()),
+            "genfens" => {
+                smp.stop_and_wait();
+                crate::genfens::run(&tokens);
+            }
             _ => {}
         }
     }
