@@ -214,6 +214,7 @@ pub struct Searcher {
     clock:         Instant,
     pub limits:    SearchLimits,
     pub best_move: Move,
+    root_score:    i32,
 
     saved_ponder:  Move,
 
@@ -271,6 +272,7 @@ impl Searcher {
             clock:     t0,
             limits,
             best_move: Move::NULL,
+            root_score:   0,
             saved_ponder: Move::NULL,
             pv_root:      Move::NULL,
             last_score:   0,
@@ -419,7 +421,15 @@ impl Searcher {
 
             if lines.is_empty() {
 
-                if !self.best_move.is_null() { best = self.best_move; }
+                if !self.best_move.is_null() && self.best_move != best {
+                    best = self.best_move;
+                    let mut pv = self.pv.root_pv();
+                    if pv.first() != Some(&best) {
+                        pv = vec![best];
+                    }
+                    let line = RootLine { mv: best, score: self.root_score, pv };
+                    self.report(board, depth, std::slice::from_ref(&line), false);
+                }
                 self.best_move = best;
                 break;
             }
@@ -437,29 +447,7 @@ impl Searcher {
                 self.pv_root = best;
             }
 
-            if self.thread_id == 0 && !self.limits.quiet {
-                self.flush_nodes();
-                let total_nodes = self.nodes_global.load(Ordering::Relaxed);
-                let elapsed_ms = self.start.elapsed().as_millis();
-                let nps = (total_nodes as u128 * 1000).checked_div(elapsed_ms).unwrap_or(0);
-                for (k, line) in lines.iter().enumerate() {
-
-                    let multipv = if num_lines > 1 { format!(" multipv {}", k + 1) } else { String::new() };
-                    let pv = line.pv.iter().map(|&m| board.move_to_uci(m)).collect::<Vec<_>>().join(" ");
-                    println!(
-                        "info depth {}{} score {} nodes {} nps {} hashfull {} tbhits {} time {} pv {}",
-                        depth,
-                        multipv,
-                        score_str(line.score),
-                        total_nodes,
-                        nps,
-                        self.tt.hashfull(),
-                        self.tbhits.load(Ordering::Relaxed),
-                        elapsed_ms,
-                        pv,
-                    );
-                }
-            }
+            self.report(board, depth, &lines, num_lines > 1);
 
             if interrupted {
                 break;
@@ -485,6 +473,32 @@ impl Searcher {
 
         self.flush_nodes();
         best
+    }
+
+    fn report(&mut self, board: &Board, depth: u32, lines: &[RootLine], multipv: bool) {
+        if self.thread_id != 0 || self.limits.quiet {
+            return;
+        }
+        self.flush_nodes();
+        let total_nodes = self.nodes_global.load(Ordering::Relaxed);
+        let elapsed_ms = self.start.elapsed().as_millis();
+        let nps = (total_nodes as u128 * 1000).checked_div(elapsed_ms).unwrap_or(0);
+        for (k, line) in lines.iter().enumerate() {
+            let multipv = if multipv { format!(" multipv {}", k + 1) } else { String::new() };
+            let pv = line.pv.iter().map(|&m| board.move_to_uci(m)).collect::<Vec<_>>().join(" ");
+            println!(
+                "info depth {}{} score {} nodes {} nps {} hashfull {} tbhits {} time {} pv {}",
+                depth,
+                multipv,
+                score_str(line.score),
+                total_nodes,
+                nps,
+                self.tt.hashfull(),
+                self.tbhits.load(Ordering::Relaxed),
+                elapsed_ms,
+                pv,
+            );
+        }
     }
 
     fn aspiration(&mut self, board: &mut Board, depth: u32, prev_score: i32) -> i32 {
@@ -855,6 +869,7 @@ impl Searcher {
 
                 if ply == 0 && score > alpha {
                     self.best_move = mv;
+                    self.root_score = score;
                     if ply < MAX_PLY - 1 {
                         self.pv.update(ply, mv);
                     }
