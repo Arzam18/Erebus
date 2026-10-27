@@ -35,6 +35,8 @@ jobs:
 
       - name: Install Android SDK tools
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android NDK
         run: sdkmanager --install "ndk;27.2.12479018"
@@ -59,10 +61,6 @@ jobs:
           fi
 
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${LINKER}" >> "${GITHUB_ENV}"
-          echo "ANDROID_NDK_BIN=${NDK_BIN}" >> "${GITHUB_ENV}"
-
-          # Use generic ARM64 optimizations rather than the runner's CPU.
-          # Align ELF segments for devices using 16 KiB memory pages.
           echo "RUSTFLAGS=-C target-cpu=generic -C link-arg=-Wl,-z,max-page-size=16384" >> "${GITHUB_ENV}"
 
       - name: Cache Rust build
