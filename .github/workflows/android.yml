@@ -1,0 +1,99 @@
+name: Build Erebus for Android ARM64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/android.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Makefile'
+      - 'src/**'
+      - 'nets/**'
+  pull_request:
+    paths:
+      - '.github/workflows/android.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Makefile'
+      - 'src/**'
+      - 'nets/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build-android-arm64:
+    name: Build ARM64 Android UCI engine
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Android SDK tools
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: sdkmanager --install "ndk;27.2.12479018"
+
+      - name: Install Rust and Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Configure Android linker
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NDK_VERSION="27.2.12479018"
+          NDK_BIN="${ANDROID_HOME}/ndk/${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          LINKER="${NDK_BIN}/aarch64-linux-android24-clang"
+
+          if [[ ! -x "${LINKER}" ]]; then
+            echo "Android linker not found: ${LINKER}" >&2
+            exit 1
+          fi
+
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${LINKER}" >> "${GITHUB_ENV}"
+          echo "ANDROID_NDK_BIN=${NDK_BIN}" >> "${GITHUB_ENV}"
+
+          # Use generic ARM64 optimizations rather than the runner's CPU.
+          # Align ELF segments for devices using 16 KiB memory pages.
+          echo "RUSTFLAGS=-C target-cpu=generic -C link-arg=-Wl,-z,max-page-size=16384" >> "${GITHUB_ENV}"
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify embedded NNUE network
+        run: test -s nets/net.nnue
+
+      - name: Build Erebus for Android ARM64
+        run: cargo build --locked --release --target aarch64-linux-android
+
+      - name: Verify and package executable
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          install -m 755 \
+            target/aarch64-linux-android/release/erebus \
+            dist/erebus-android-arm64
+
+          file dist/erebus-android-arm64
+          readelf -h dist/erebus-android-arm64 | tee dist/elf-header.txt
+          grep -q 'Machine:.*AArch64' dist/elf-header.txt
+
+          sha256sum dist/erebus-android-arm64 | tee dist/SHA256SUMS
+
+      - name: Upload Android ARM64 engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: erebus-android-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
